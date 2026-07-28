@@ -25,6 +25,7 @@ import {
   parseClaudeEfforts,
   parseCodexEfforts,
 } from './modelSelection';
+import { resolveCliInvocation } from './cliRuntime';
 
 const execFileAsync = promisify(execFile);
 
@@ -488,6 +489,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return `${provider.id}\0${this.cliBinFor(provider)}`;
   }
 
+  /**
+   * Resolve a CLI control command in the same OS runtime used by interactive login.
+   * In particular, Windows-hosted Codex login runs in WSL, so its status and logout
+   * commands must also run there to observe the same credential store.
+   */
+  private cliInvocation(provider: ChatProvider, args: readonly string[]) {
+    return resolveCliInvocation(provider.id, this.cliBinFor(provider), args);
+  }
+
   private discoveredEffortsForModel(provider: ChatProvider, model: string): readonly string[] {
     const discovered = this.effortCapabilities.get(this.effortCapabilityKey(provider));
     return discovered?.byModel[model] ?? discovered?.efforts ?? effortsForModel(provider, model);
@@ -511,7 +521,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       let capabilities: EffortCapabilities | undefined;
       try {
         if (provider.id === 'claude-code') {
-          const { stdout } = await execFileAsync(this.cliBinFor(provider), ['--help'], {
+          const invocation = this.cliInvocation(provider, ['--help']);
+          const { stdout } = await execFileAsync(invocation.executable, invocation.args, {
             cwd: this.repoRoot || undefined,
             maxBuffer: 2 * 1024 * 1024,
           });
@@ -519,11 +530,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         } else if (provider.id === 'codex') {
           // `high` is understood by old and new Codex builds. The override lets the
           // catalog load even when config.toml contains a level from a newer CLI.
-          const { stdout } = await execFileAsync(
-            this.cliBinFor(provider),
+          const invocation = this.cliInvocation(
+            provider,
             ['-c', 'model_reasoning_effort=high', 'debug', 'models'],
-            { cwd: this.repoRoot || undefined, maxBuffer: 10 * 1024 * 1024 },
           );
+          const { stdout } = await execFileAsync(invocation.executable, invocation.args, {
+            cwd: this.repoRoot || undefined,
+            maxBuffer: 10 * 1024 * 1024,
+          });
           capabilities = parseCodexEfforts(stdout);
         }
       } catch {
@@ -561,10 +575,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const bin = this.cliBinFor(provider);
-    const term = vscode.window.createTerminal({
+    const terminalOptions: vscode.TerminalOptions = {
       name: `sema · ${provider.label}`,
       cwd: this.repoRoot || undefined,
-    });
+    };
+    // Codex CLI is supported through WSL on Windows. Explicitly select WSL here
+    // instead of inheriting the user's default VS Code terminal (usually PowerShell),
+    // where the Linux Codex executable is unavailable.
+    if (process.platform === 'win32' && provider.id === 'codex') {
+      terminalOptions.shellPath = 'wsl.exe';
+    }
+    const term = vscode.window.createTerminal(terminalOptions);
     this.loginTerm = term;
     term.show();
     term.sendText(`"${bin}" ${this.authArgs(provider, provider.auth.login).join(' ')}`);
@@ -636,7 +657,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // would race this logout and could flip the header back to "signed in".
     this.stopLoginWatch();
     try {
-      await execFileAsync(this.cliBinFor(provider), this.authArgs(provider, provider.auth.logout), {
+      const invocation = this.cliInvocation(
+        provider,
+        this.authArgs(provider, provider.auth.logout),
+      );
+      await execFileAsync(invocation.executable, invocation.args, {
         cwd: this.repoRoot || undefined,
       });
       vscode.window.showInformationMessage(`sema: signed out of ${provider.label}.`);
@@ -664,13 +689,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     let loggedIn = false;
     try {
-      const { stdout } = await execFileAsync(
-        this.cliBinFor(provider),
+      const invocation = this.cliInvocation(
+        provider,
         this.authArgs(provider, provider.auth.status),
-        {
-        cwd: this.repoRoot || undefined,
-        },
       );
+      const { stdout } = await execFileAsync(invocation.executable, invocation.args, {
+        cwd: this.repoRoot || undefined,
+      });
       loggedIn = parseSignedIn(stdout);
     } catch {
       // Non-zero exit (or CLI not found) — treat as not signed in.
