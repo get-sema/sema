@@ -36,6 +36,15 @@ const html = ChatViewProvider.prototype.getHtml.call({});
 for (const id of ['plusbtn', 'semabtn', 'modepill', 'permissionpill', 'modelpill']) {
   if (!html.includes(`id="${id}"`)) throw new Error(`composer is missing the ${id} control`);
 }
+if (!/<div id="submit-row">\s*<button id="send"/.test(html)) {
+  throw new Error('send button must remain in its protected composer group');
+}
+if (!/#controls \{[^}]*flex-wrap: wrap;/.test(html)) {
+  throw new Error('composer controls must wrap when the chat panel narrows');
+}
+if (!/#toolbar \{[^}]*grid-template-columns: minmax\(0, 1fr\) auto;/.test(html)) {
+  throw new Error('composer must reserve a non-overlapping column for the send button');
+}
 // The header notice is the only pre-send signal that a provider cannot answer yet
 // (missing API key, or not signed in), so it must survive refactors of the header.
 if (!html.includes('id="authnotice"')) throw new Error('header is missing the authnotice control');

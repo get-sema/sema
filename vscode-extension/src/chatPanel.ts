@@ -1492,9 +1492,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .chip .x:hover { background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); color: var(--vscode-foreground); }
   .msg .chips { margin-top: 6px; justify-content: flex-end; }
   #input { resize: none; background: transparent; color: var(--vscode-input-foreground); border: none; outline: none; padding: 2px 4px; font-family: inherit; font-size: var(--vscode-font-size); line-height: 1.5; max-height: 160px; overflow-y: auto; }
-  #toolbar { display: flex; align-items: center; gap: 6px; }
-  #controls { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+  #toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 6px; min-width: 0; }
+  #controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
   #controls .spacer { flex: 1; min-width: 0; }
+  #submit-row { display: flex; align-items: flex-end; justify-content: flex-end; min-width: 0; }
   /* Round icon buttons (attachments) */
   .roundbtn { position: relative; width: 28px; height: 28px; min-width: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 999px; background: transparent; color: var(--vscode-foreground); cursor: pointer; flex: none; }
   .roundbtn:hover { border-color: var(--vscode-focusBorder); background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); }
@@ -1591,7 +1592,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <button id="permissionpill" class="access-indicator" title="Require approval — click to change permissions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v5c0 5-3.4 8.5-8 10-4.6-1.5-8-5-8-10V6l8-3z"></path><path d="M9 12l2 2 4-4"></path></svg><span>Approval</span><svg class="caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg></button>
         <button id="modelpill" class="pill" title="Provider, model and reasoning effort"><span class="cap">default</span><svg class="caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg><span class="dot"></span></button>
       </div>
-      <button id="send" title="Send"></button>
+      <div id="submit-row">
+        <button id="send" title="Send"></button>
+      </div>
     </div>
   </div>
   <script nonce="${nonce}">
