@@ -4,10 +4,28 @@ import { promisify } from 'util';
 import * as path from 'path';
 import { SemaClient, SessionUsage, SearchResult } from './semaClient';
 import { ChatMessage, PROVIDERS, getProvider } from './providers';
-import { Attachment, ChatProvider, TokenUsage } from './providers/types';
+import { parseSignedIn } from './providers/cli';
+import {
+  AgentPermissionMode,
+  Attachment,
+  ChatProvider,
+  PermissionRequest,
+  TokenUsage,
+} from './providers/types';
 import { redactPieces, redactionSummary } from './redact';
 import { SessionStore, StoredSession, createSession, freshUsage, titleFromMessages } from './sessionStore';
 import { formatSize, materialize, stage, totalBytes, unstage, LIMITS } from './attachments';
+import { buildSystem } from './semaWorkflow';
+import { compatibleCliSession, normalizeChatMode, shouldPrefetchIndex } from './chatMode';
+import { readPlanArtifact, savePlanArtifact } from './planArtifact';
+import {
+  EffortCapabilities,
+  LEGACY_CODEX_EFFORTS,
+  effortsForModel,
+  parseClaudeEfforts,
+  parseCodexEfforts,
+} from './modelSelection';
+import { codexUsesWsl, resolveCliInvocation } from './cliRuntime';
 
 const execFileAsync = promisify(execFile);
 
@@ -17,6 +35,11 @@ const MODE_KEY = 'sema.chat.mode';
 const INDEX_KEY = 'sema.chat.useIndex';
 const REDACT_KEY = 'sema.chat.redact';
 const EFFORT_KEY = 'sema.chat.effort';
+const PERMISSION_KEY = 'sema.chat.permissions';
+/** How long to keep polling for a launched login to finish (browser round-trip). */
+const LOGIN_WATCH_MS = 3 * 60 * 1000;
+/** Floor between on-focus sign-in re-probes, so window switching can't spam the CLI. */
+const AUTH_PROBE_THROTTLE_MS = 5_000;
 const CUSTOM_MODELS_KEY = 'sema.chat.customModels';
 const RESOLVED_DEFAULT_KEY = 'sema.chat.resolvedDefault';
 // Per-workspace pointer to the session to reopen on the next launch (survives restart).
@@ -24,73 +47,6 @@ const ACTIVE_SESSION_KEY = 'sema.chat.activeSessionId';
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + '\n… (truncated)' : s;
-}
-
-const PLAN_NOTE =
-  'You are in plan mode. Investigate the problem and produce a concise, step-by-step ' +
-  'implementation plan — the files to change, the approach, and the order of the steps. Do ' +
-  'NOT edit files or write the full implementation; output the plan only, then stop.';
-
-function buildSystem(context: string, readsWorkspace: boolean, mode: string): string {
-  const plan = mode === 'plan';
-  // CLI agents (Claude Code / Codex) run under their own system prompt and read the repo
-  // themselves, and Ask/Agent is enforced by CLI flags — not by wording. So impose no
-  // persona (a plain "hi" gets a plain reply) except a plan directive in Plan mode. Only
-  // pass the retrieved context when the index is on.
-  if (readsWorkspace) {
-    const parts: string[] = [];
-    if (plan) {
-      parts.push(PLAN_NOTE, '');
-    }
-    if (context) {
-      parts.push(
-        "Relevant code from sema's semantic index (a starting point — read more files if needed):",
-        '',
-        context,
-      );
-    }
-    return parts.join('\n').trim();
-  }
-
-  // API providers are bare models. In Agent mode sema hands them workspace tools (see
-  // providers/tools.ts) and runs the tool loop, so tell them to act; otherwise give a short
-  // role plus the retrieved code (RAG), since they can't read files themselves.
-  const agent = mode === 'agent';
-  let lines: string[];
-  if (agent) {
-    lines = [
-      "You are a coding agent working directly in the user's workspace through tools. Available " +
-        'tools: search_code (semantic search of the codebase — usually the best first step), ' +
-        "get_code (fetch a symbol's full source), grep (regex text search), glob (find files by " +
-        'pattern), list_directory, read_file, write_file, edit_file (surgical string replacement — ' +
-        'prefer it over rewriting whole files), delete_file, and run_command (shell: builds, tests, ' +
-        'git, scaffolding). When the request is a task that inspects or changes the project, use ' +
-        'tools to actually do it — explore first (search_code / grep / read_file), then change ' +
-        '(edit_file / write_file), then verify (run_command) — instead of only describing the ' +
-        'steps, and briefly summarize what you changed when done. For greetings, small talk, or ' +
-        'questions that do not require the workspace, reply directly and do NOT call any tool.',
-    ];
-  } else if (plan) {
-    lines = [
-      'You are a coding assistant in plan mode. You have read-only tools — search_code, get_code, ' +
-        'grep, glob, list_directory, read_file — to investigate the codebase before planning; use ' +
-        'them to ground your plan in the actual code. For a greeting or a message that is not a ' +
-        'task to plan, reply briefly without using any tool. ' +
-        PLAN_NOTE,
-    ];
-  } else {
-    lines = ['You are a coding assistant. Answer the user directly and concisely.'];
-  }
-  if (context) {
-    lines.push('', 'Use the retrieved code below (you cannot read files directly):', '', context);
-  } else {
-    lines.push(
-      '',
-      "You cannot read the user's files directly. Answer from the conversation; if their code is",
-      'needed, suggest turning on the sema index.',
-    );
-  }
-  return lines.join('\n');
 }
 
 /** Turn a provider/SDK error into a user-facing message; explain common rate limits (429). */
@@ -111,7 +67,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private controller?: AbortController;
   private loginTerm?: vscode.Terminal;
+  /** In-flight `watchLogin` poll: its timer, and the provider it is waiting on. */
+  private loginWatchTimer?: ReturnType<typeof setTimeout>;
+  private loginWatchProvider?: string;
+  /** Last known sign-in verdict per provider id — gates the on-focus re-probe. */
+  private readonly authState = new Map<string, boolean>();
+  private lastAuthProbe = 0;
+  /** Capabilities are keyed by provider + configured executable, so path changes re-probe. */
+  private readonly effortCapabilities = new Map<string, EffortCapabilities>();
+  private readonly effortDiscoveries = new Map<string, Promise<EffortCapabilities>>();
   private redactHintShown = false;
+  /** Keep parallel tool requests from opening overlapping inline permission cards. */
+  private permissionQueue: Promise<void> = Promise.resolve();
+  private permissionEpoch = 0;
+  private nextPermissionId = 0;
+  private readonly pendingPermissions = new Map<
+    string,
+    (decision: 'allow' | 'deny') => void
+  >();
   /** Durable, per-workspace session storage (undefined only if storage is unavailable). */
   private store?: SessionStore;
   /** The conversation currently on screen — its `messages` array is the live transcript. */
@@ -187,8 +160,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return stored && valid.includes(stored) ? stored : provider.defaultModel;
   }
 
-  private get mode(): string {
-    return this.context.globalState.get<string>(MODE_KEY) ?? 'ask';
+  private get mode(): 'ask' | 'plan' | 'agent' {
+    return normalizeChatMode(this.context.globalState.get<string>(MODE_KEY));
   }
 
   private get useIndex(): boolean {
@@ -207,7 +180,73 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private get effort(): string {
     const provider = getProvider(this.providerId);
     const stored = this.context.globalState.get<string>(EFFORT_KEY);
-    return stored && provider.efforts?.includes(stored) ? stored : 'default';
+    const accepted = this.discoveredEffortsForModel(provider, this.modelId);
+    return stored && accepted.includes(stored) ? stored : 'default';
+  }
+
+  /** Permission choice is stored per provider so Claude and Codex never overwrite each other. */
+  private get permissionMode(): AgentPermissionMode {
+    const provider = getProvider(this.providerId);
+    const stored =
+      this.context.globalState.get<Record<string, AgentPermissionMode>>(PERMISSION_KEY)?.[provider.id];
+    return stored && provider.permissionModes?.includes(stored) ? stored : 'ask';
+  }
+
+  /** Inline chat consent prompt shared by Claude Agent SDK and Codex app-server. */
+  private async requestPermission(request: PermissionRequest): Promise<'allow' | 'deny'> {
+    const epoch = this.permissionEpoch;
+    let resolveDecision!: (decision: 'allow' | 'deny') => void;
+    const decision = new Promise<'allow' | 'deny'>((resolve) => { resolveDecision = resolve; });
+    this.permissionQueue = this.permissionQueue
+      .then(async () => {
+        // A stopped turn may already have queued several parallel tool requests.
+        // Do not surface those stale requests after the current one is rejected.
+        if (epoch !== this.permissionEpoch) {
+          resolveDecision('deny');
+          return;
+        }
+
+        const id = `permission-${++this.nextPermissionId}`;
+        const response = new Promise<'allow' | 'deny'>((resolve) => {
+          this.pendingPermissions.set(id, resolve);
+        });
+        try {
+          const posted = await (this.view?.webview.postMessage({
+            type: 'permissionRequest',
+            id,
+            request,
+          }) ?? Promise.resolve(false));
+          if (!posted) {
+            this.resolvePermission(id, 'deny');
+          }
+          resolveDecision(await response);
+        } catch {
+          this.resolvePermission(id, 'deny');
+          resolveDecision('deny');
+        }
+      })
+      .catch(() => resolveDecision('deny'));
+    return decision;
+  }
+
+  /** Resolve one visible permission card; unknown or repeated responses are ignored. */
+  private resolvePermission(id: string, decision: 'allow' | 'deny'): boolean {
+    const resolve = this.pendingPermissions.get(id);
+    if (!resolve) {
+      return false;
+    }
+    this.pendingPermissions.delete(id);
+    resolve(decision);
+    void this.view?.webview.postMessage({ type: 'permissionResolved', id, decision });
+    return true;
+  }
+
+  /** Reject the visible card and invalidate requests queued by the stopped turn. */
+  private cancelPermissions(): void {
+    this.permissionEpoch += 1;
+    for (const id of [...this.pendingPermissions.keys()]) {
+      this.resolvePermission(id, 'deny');
+    }
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -222,6 +261,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         view.webview.postMessage({ type: 'assistantEnd' });
       });
     });
+    view.onDidDispose(() => {
+      if (this.view === view) {
+        this.view = undefined;
+        this.cancelPermissions();
+        this.stopLoginWatch();
+      }
+    });
     // Re-check sign-in state when the panel regains focus (e.g. after logging in
     // via the terminal) or when the login terminal is closed.
     view.onDidChangeVisibility(() => {
@@ -235,12 +281,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         void this.refreshAuthState();
       }
     });
+    // Coming back to VS Code is the moment a sign-in done elsewhere (another terminal,
+    // the browser) has just finished. Only re-probe while we believe this provider is
+    // signed out: that is the only direction the answer can move on its own, and each
+    // probe shells out to the CLI. Throttled so rapid window switching can't spam it.
+    vscode.window.onDidChangeWindowState((s) => {
+      if (!s.focused || !this.believesSignedOut()) {
+        return;
+      }
+      const now = Date.now();
+      if (now - this.lastAuthProbe < AUTH_PROBE_THROTTLE_MS) {
+        return;
+      }
+      this.lastAuthProbe = now;
+      void this.refreshAuthState();
+    });
+  }
+
+  /** True when the active provider can sign in and last reported that it had not. */
+  private believesSignedOut(): boolean {
+    const provider = getProvider(this.providerId);
+    return !!provider.auth && this.authState.get(provider.id) === false;
   }
 
   /** "New chat" — save the current session (if it has content), then start a fresh one. */
   clearConversation(): void {
     this.persist();
     this.controller?.abort();
+    this.cancelPermissions();
     this.session = createSession(this.providerId, this.modelId);
     // Composer chips were staged under the old session's directory, so they can't
     // carry over; gcOrphans sweeps their bytes.
@@ -300,6 +368,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.controller?.abort();
+    this.cancelPermissions();
     this.session = loaded;
     this.clearPending();
     this.applyUsage(loaded.usage);
@@ -313,6 +382,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.store?.delete(id);
     if (id === this.session.id) {
       this.controller?.abort();
+      this.cancelPermissions();
       this.session = createSession(this.providerId, this.modelId);
       this.clearPending();
       this.applyUsage(freshUsage());
@@ -406,7 +476,101 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (provider.id === 'opencode') {
       return cfg.get<string>('chat.opencodePath') || 'opencode';
     }
+    if (provider.id === 'grok') {
+      return cfg.get<string>('chat.grokPath') || 'grok';
+    }
+    if (provider.id === 'cursor') {
+      return cfg.get<string>('chat.cursorPath') || 'cursor-agent';
+    }
     return provider.id;
+  }
+
+  private effortCapabilityKey(provider: ChatProvider): string {
+    return `${provider.id}\0${this.cliBinFor(provider)}`;
+  }
+
+  /** `sema.chat.codexUseWsl` — run Codex inside WSL on a Windows host. */
+  private codexWsl(): boolean {
+    return vscode.workspace.getConfiguration('sema').get<boolean>('chat.codexUseWsl', false);
+  }
+
+  /**
+   * Resolve a CLI control command in the same OS runtime used by interactive login.
+   * When Codex is set to run in WSL, its status and logout commands must also run
+   * there to observe the same credential store.
+   */
+  private cliInvocation(provider: ChatProvider, args: readonly string[]) {
+    return resolveCliInvocation(provider.id, this.cliBinFor(provider), args, this.codexWsl());
+  }
+
+  private discoveredEffortsForModel(provider: ChatProvider, model: string): readonly string[] {
+    const discovered = this.effortCapabilities.get(this.effortCapabilityKey(provider));
+    return discovered?.byModel[model] ?? discovered?.efforts ?? effortsForModel(provider, model);
+  }
+
+  /** Ask each configured CLI for its real effort contract and cache the result. */
+  private async discoverEffortCapabilities(provider: ChatProvider): Promise<EffortCapabilities> {
+    if (!provider.efforts?.length) {
+      return { efforts: [], byModel: {} };
+    }
+    const key = this.effortCapabilityKey(provider);
+    const cached = this.effortCapabilities.get(key);
+    if (cached) {
+      return cached;
+    }
+    const pending = this.effortDiscoveries.get(key);
+    if (pending) {
+      return pending;
+    }
+    const discovery = (async (): Promise<EffortCapabilities> => {
+      let capabilities: EffortCapabilities | undefined;
+      try {
+        if (provider.id === 'claude-code') {
+          const invocation = this.cliInvocation(provider, ['--help']);
+          const { stdout } = await execFileAsync(invocation.executable, invocation.args, {
+            cwd: this.repoRoot || undefined,
+            maxBuffer: 2 * 1024 * 1024,
+          });
+          capabilities = parseClaudeEfforts(stdout);
+        } else if (provider.id === 'codex') {
+          // `high` is understood by old and new Codex builds. The override lets the
+          // catalog load even when config.toml contains a level from a newer CLI.
+          const invocation = this.cliInvocation(
+            provider,
+            ['-c', 'model_reasoning_effort=high', 'debug', 'models'],
+          );
+          const { stdout } = await execFileAsync(invocation.executable, invocation.args, {
+            cwd: this.repoRoot || undefined,
+            maxBuffer: 10 * 1024 * 1024,
+          });
+          capabilities = parseCodexEfforts(stdout);
+        }
+      } catch {
+        // Fall through to the provider-specific compatibility contract below.
+      }
+      if (!capabilities && provider.id === 'codex') {
+        const byModel = Object.fromEntries(
+          provider.modelInfos.map((model) => [model.id, LEGACY_CODEX_EFFORTS]),
+        );
+        capabilities = { efforts: LEGACY_CODEX_EFFORTS, byModel };
+      }
+      capabilities ??= { efforts: provider.efforts ?? [], byModel: {} };
+      this.effortCapabilities.set(key, capabilities);
+      return capabilities;
+    })();
+    this.effortDiscoveries.set(key, discovery);
+    try {
+      return await discovery;
+    } finally {
+      this.effortDiscoveries.delete(key);
+    }
+  }
+
+  /** Codex auth must still open when an older binary cannot parse a newer saved effort. */
+  private authArgs(provider: ChatProvider, args: readonly string[]): string[] {
+    return provider.id === 'codex'
+      ? ['-c', 'model_reasoning_effort=high', ...args]
+      : [...args];
   }
 
   /** Open a terminal and run the CLI's own login — interactive OAuth in the browser. */
@@ -416,17 +580,73 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const bin = this.cliBinFor(provider);
-    const term = vscode.window.createTerminal({
+    const terminalOptions: vscode.TerminalOptions = {
       name: `sema · ${provider.label}`,
       cwd: this.repoRoot || undefined,
-    });
+    };
+    // When Codex lives in WSL, select WSL explicitly instead of inheriting the
+    // user's default VS Code terminal (usually PowerShell), where the Linux Codex
+    // executable is unavailable.
+    if (codexUsesWsl(provider.id, this.codexWsl())) {
+      terminalOptions.shellPath = 'wsl.exe';
+    }
+    const term = vscode.window.createTerminal(terminalOptions);
     this.loginTerm = term;
     term.show();
-    term.sendText(`"${bin}" ${provider.auth.login.join(' ')}`);
+    term.sendText(`"${bin}" ${this.authArgs(provider, provider.auth.login).join(' ')}`);
+    this.watchLogin(provider.id);
     this.view?.webview.postMessage({
       type: 'notice',
-      text: `Opened a terminal to sign in to ${provider.label}. Finish in your browser, then send your message again.`,
+      text: `Opened a terminal to sign in to ${provider.label}. The panel updates on its own once you're signed in.`,
     });
+  }
+
+  private stopLoginWatch(): void {
+    if (this.loginWatchTimer) {
+      clearTimeout(this.loginWatchTimer);
+      this.loginWatchTimer = undefined;
+    }
+    this.loginWatchProvider = undefined;
+  }
+
+  /**
+   * Poll sign-in state until the login we just launched lands.
+   *
+   * The login runs in a terminal we don't own: the CLI leaves it open at the shell
+   * prompt afterwards, and the panel usually stays visible the whole time, so neither
+   * onDidCloseTerminal nor a visibility change fires. Without this the header keeps
+   * saying "Sign in" at an already signed-in user until the window is reloaded.
+   *
+   * Polls fast at first (the CLI may already hold a valid token), then backs off, since
+   * each tick shells out — and for some CLIs that is a network call. Gives up after a
+   * few minutes; the visibility and terminal-close triggers still cover a late finish.
+   */
+  private watchLogin(providerId: string): void {
+    this.stopLoginWatch();
+    this.loginWatchProvider = providerId;
+    const startedAt = Date.now();
+    const tick = async (): Promise<void> => {
+      // A newer login, a provider switch, or a disposed view supersedes this watch.
+      if (this.loginWatchProvider !== providerId || this.providerId !== providerId || !this.view) {
+        this.stopLoginWatch();
+        return;
+      }
+      const elapsed = Date.now() - startedAt;
+      if (await this.refreshAuthState()) {
+        this.stopLoginWatch();
+        this.view?.webview.postMessage({
+          type: 'notice',
+          text: `Signed in to ${getProvider(providerId).label}.`,
+        });
+        return;
+      }
+      if (elapsed > LOGIN_WATCH_MS) {
+        this.stopLoginWatch();
+        return;
+      }
+      this.loginWatchTimer = setTimeout(() => void tick(), elapsed < 30_000 ? 2_000 : 5_000);
+    };
+    this.loginWatchTimer = setTimeout(() => void tick(), 2_000);
   }
 
   private async logout(): Promise<void> {
@@ -438,8 +658,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (ok !== 'Sign out') {
       return;
     }
+    // A signing-out user has abandoned any login we were polling for; letting it run
+    // would race this logout and could flip the header back to "signed in".
+    this.stopLoginWatch();
     try {
-      await execFileAsync(this.cliBinFor(provider), provider.auth.logout, {
+      const invocation = this.cliInvocation(
+        provider,
+        this.authArgs(provider, provider.auth.logout),
+      );
+      await execFileAsync(invocation.executable, invocation.args, {
         cwd: this.repoRoot || undefined,
       });
       vscode.window.showInformationMessage(`sema: signed out of ${provider.label}.`);
@@ -449,68 +676,80 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.refreshAuthState();
   }
 
-  /** Ask the provider CLI whether it's signed in, and update the panel's Login button. */
-  private async refreshAuthState(): Promise<void> {
+  /**
+   * Ask the provider CLI whether it's signed in, and update the panel's Login button.
+   * Returns the verdict so a caller can stop polling once sign-in lands.
+   */
+  private async refreshAuthState(): Promise<boolean> {
     const view = this.view;
     if (!view) {
-      return;
+      return false;
     }
     const provider = getProvider(this.providerId);
+    // Stamp the provider on the reply: this resolves asynchronously, so the user may
+    // have switched by the time it lands, and the webview drops verdicts for others.
     if (!provider.auth) {
-      view.webview.postMessage({ type: 'auth', canLogin: false });
-      return;
+      view.webview.postMessage({ type: 'auth', provider: provider.id, canLogin: false });
+      return false;
     }
     let loggedIn = false;
     try {
-      const { stdout } = await execFileAsync(this.cliBinFor(provider), provider.auth.status, {
+      const invocation = this.cliInvocation(
+        provider,
+        this.authArgs(provider, provider.auth.status),
+      );
+      const { stdout } = await execFileAsync(invocation.executable, invocation.args, {
         cwd: this.repoRoot || undefined,
       });
-      const out = stdout.trim();
-      try {
-        // Claude Code prints JSON: { "loggedIn": true, ... }
-        const j = JSON.parse(out) as { loggedIn?: boolean };
-        loggedIn =
-          typeof j.loggedIn === 'boolean'
-            ? j.loggedIn
-            : !/not\s+logged\s*in|not\s+authenticated|logged\s+out/i.test(out);
-      } catch {
-        // Codex prints plain text ("Not logged in" when signed out).
-        loggedIn = !/not\s+logged\s*in|not\s+authenticated|logged\s+out|no\s+credentials/i.test(out);
-      }
+      loggedIn = parseSignedIn(stdout);
     } catch {
       // Non-zero exit (or CLI not found) — treat as not signed in.
       loggedIn = false;
     }
-    view.webview.postMessage({ type: 'auth', canLogin: true, loggedIn });
+    this.authState.set(provider.id, loggedIn);
+    view.webview.postMessage({ type: 'auth', provider: provider.id, canLogin: true, loggedIn });
+    return loggedIn;
   }
 
-  /** When the index toggle turns on, ensure an index exists — build it (with progress) if not. */
-  private async ensureIndexReady(): Promise<void> {
+  /** Ensure the index exists and matches current source hashes. */
+  private async ensureIndexReady(): Promise<boolean> {
     const client = this.makeClient();
     if (!client) {
-      return;
+      return false;
     }
-    let ready = false;
+    let exists = false;
+    let stale = false;
     try {
-      ready = (await client.status()).index.exists === true;
+      const status = (await client.status()).index;
+      exists = status.exists === true;
+      stale = status.stale === true;
     } catch {
-      ready = false;
+      exists = false;
     }
-    if (ready) {
-      return;
+    if (exists && !stale) {
+      return true;
     }
 
     this.view?.webview.postMessage({
       type: 'notice',
-      text: 'No sema index yet — building it now…',
+      text: stale
+        ? 'Source files changed — refreshing the sema index…'
+        : 'No sema index yet — building it now…',
     });
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'sema: building index…' },
+    return vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: stale ? 'sema: refreshing index…' : 'sema: building index…',
+      },
       async () => {
         try {
           await client.index();
-          this.view?.webview.postMessage({ type: 'notice', text: 'sema index ready.' });
+          this.view?.webview.postMessage({
+            type: 'notice',
+            text: stale ? 'sema index refreshed.' : 'sema index ready.',
+          });
           this.refresh?.();
+          return true;
         } catch (err) {
           // Build failed — turn the toggle back off so the state stays honest.
           await this.context.globalState.update(INDEX_KEY, false);
@@ -519,6 +758,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             type: 'error',
             message: `sema index failed: ${(err as Error).message}`,
           });
+          return false;
         }
       },
     );
@@ -636,6 +876,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.sendPending();
         void this.refreshAuthState();
         break;
+      case 'manage':
+        await vscode.commands.executeCommand('sema.manage.open');
+        break;
+      case 'updateAgents':
+        await vscode.commands.executeCommand('sema.manage.updateAgents');
+        break;
       case 'attach':
         await this.attachViaDialog();
         break;
@@ -661,7 +907,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'stop':
         this.controller?.abort();
+        this.cancelPermissions();
         break;
+      case 'permissionDecision': {
+        const decision = msg.decision === 'allow' ? 'allow' : 'deny';
+        this.resolvePermission(String(msg.id ?? ''), decision);
+        break;
+      }
       case 'newSession':
         this.clearConversation();
         break;
@@ -675,6 +927,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.deleteSession(String(msg.id ?? ''));
         break;
       case 'setProvider':
+        // Any login we were waiting on belongs to the provider being left.
+        this.stopLoginWatch();
         await this.context.globalState.update(PROVIDER_KEY, String(msg.provider));
         await this.context.globalState.update(MODEL_KEY, undefined);
         await this.sendConfig();
@@ -682,6 +936,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'setModel':
         await this.context.globalState.update(MODEL_KEY, String(msg.model));
+        // The selected model may support a narrower reasoning range (for example,
+        // GPT-5.5 has no max/ultra). Push normalized config back to the webview.
+        await this.sendConfig();
         break;
       case 'setMode':
         await this.context.globalState.update(MODE_KEY, String(msg.mode));
@@ -701,8 +958,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       case 'setEffort':
-        await this.context.globalState.update(EFFORT_KEY, String(msg.effort));
+        {
+          const provider = getProvider(this.providerId);
+          await this.discoverEffortCapabilities(provider);
+          const requested = String(msg.effort);
+          const effort = this.discoveredEffortsForModel(provider, this.modelId).includes(requested)
+            ? requested
+            : 'default';
+          await this.context.globalState.update(EFFORT_KEY, effort);
+        }
         break;
+      case 'setPermission': {
+        const provider = getProvider(this.providerId);
+        const requested = String(msg.permission) as AgentPermissionMode;
+        if (provider.permissionModes?.includes(requested)) {
+          const all =
+            this.context.globalState.get<Record<string, AgentPermissionMode>>(PERMISSION_KEY) ?? {};
+          all[provider.id] = requested;
+          await this.context.globalState.update(PERMISSION_KEY, all);
+        }
+        await this.sendConfig();
+        break;
+      }
       case 'customModel': {
         const cmProvider = getProvider(this.providerId);
         const example =
@@ -758,23 +1035,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       provider.requiresKey && provider.secretKey
         ? !!(await this.context.secrets.get(provider.secretKey))
         : false;
+    const capabilityEntries = await Promise.all(
+      PROVIDERS.map(async (item) =>
+        [item.id, await this.discoverEffortCapabilities(item)] as const,
+      ),
+    );
+    const capabilities = new Map(capabilityEntries);
     this.view.webview.postMessage({
       type: 'config',
-      providers: PROVIDERS.map((p) => ({
-        id: p.id,
-        label: p.label,
-        models: [...p.models, ...this.customModels(p.id)],
-        modelInfos: [
-          ...p.modelInfos,
-          ...this.customModels(p.id).map((id) => ({ id, name: id, section: 'Custom' })),
-        ],
-        // Empty for providers with no effort control — the picker stays hidden.
-        efforts: p.efforts ?? [],
-      })),
+      providers: PROVIDERS.map((p) => {
+        const discovered = capabilities.get(p.id);
+        return {
+          id: p.id,
+          label: p.label,
+          models: [...p.models, ...this.customModels(p.id)],
+          modelInfos: [
+            ...p.modelInfos.map((info) =>
+              discovered?.byModel[info.id]
+                ? { ...info, efforts: discovered.byModel[info.id] }
+                : info,
+            ),
+            ...this.customModels(p.id).map((id) => ({ id, name: id, section: 'Custom' })),
+          ],
+          // Empty for providers with no effort control — the picker stays hidden.
+          efforts: discovered?.efforts ?? [],
+          permissionModes: p.permissionModes ?? [],
+        };
+      }),
       provider: provider.id,
       model: this.modelId,
       mode: this.mode,
       effort: this.effort,
+      permission: this.permissionMode,
       defaults: this.context.globalState.get<Record<string, string>>(RESOLVED_DEFAULT_KEY) ?? {},
       useIndex: this.useIndex,
       redact: this.redact,
@@ -791,6 +1083,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const provider = getProvider(this.providerId);
+    await this.discoverEffortCapabilities(provider);
     let apiKey: string | undefined;
     if (provider.requiresKey) {
       apiKey = provider.secretKey
@@ -833,23 +1126,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // API providers can't read files, so retrieve code and inject it (RAG).
     // CLI providers read the repo themselves — send the prompt directly, like Cursor.
     let context = '';
-    if (this.useIndex && text.trim()) {
-      view.webview.postMessage({ type: 'status', text: 'searching sema index…' });
-      const client = this.makeClient();
-      if (client) {
-        const retrieved = await this.buildContext(text, client);
-        context = retrieved.text;
-        if (retrieved.items.length) {
-          // Show the user exactly what sema pulled into context (clickable to open).
-          view.webview.postMessage({
-            type: 'context',
-            items: retrieved.items.map((r) => ({
-              file: r.file,
-              name: r.name,
-              type: r.type,
-              line: r.start_line,
-            })),
-          });
+    if (shouldPrefetchIndex(this.useIndex, this.mode) && text.trim()) {
+      // The visible toggle is authoritative in every mode. Re-check hashes every
+      // enabled turn so persisted state cannot serve stale context.
+      const indexReady = await this.ensureIndexReady();
+      if (indexReady) {
+        view.webview.postMessage({ type: 'status', text: 'searching sema index…' });
+        const client = this.makeClient();
+        if (client) {
+          const retrieved = await this.buildContext(text, client);
+          context = retrieved.text;
+          if (retrieved.items.length) {
+            // Show the user exactly what sema pulled into context (clickable to open).
+            view.webview.postMessage({
+              type: 'context',
+              items: retrieved.items.map((r) => ({
+                file: r.file,
+                name: r.name,
+                type: r.type,
+                line: r.start_line,
+              })),
+            });
+          }
         }
       }
       if (this.controller.signal.aborted) {
@@ -886,21 +1184,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // after materialize so that text pulled in from attachments is scrubbed too; binary
     // attachments were rejected above, so no base64 can reach the redactor (its EMAIL
     // and card-number patterns would match inside a base64 blob).
+    let activePlan =
+      this.mode === 'agent' && this.session.planPath
+        ? await readPlanArtifact(this.repoRoot, this.session.planPath)
+        : '';
     let outContext = context;
     let outMessages: ChatMessage[] = mat.messages;
     if (this.redact) {
       view.webview.postMessage({ type: 'status', text: 'redacting sensitive data…' });
       const semaBin = vscode.workspace.getConfiguration('sema').get<string>('binaryPath') || 'sema';
-      const pieces = [context, ...mat.messages.map((m) => m.content)];
+      const pieces = [context, activePlan, ...mat.messages.map((m) => m.content)];
       const res = await redactPieces(pieces, {
         semaBin,
         cwd: this.repoRoot,
         signal: this.controller.signal,
       });
       outContext = res.pieces[0] ?? context;
+      activePlan = res.pieces[1] ?? activePlan;
       // Spread rather than rebuild: `attachments` must survive redaction, or every
       // image would be silently dropped whenever the redact toggle is on.
-      outMessages = mat.messages.map((m, i) => ({ ...m, content: res.pieces[i + 1] ?? m.content }));
+      outMessages = mat.messages.map((m, i) => ({ ...m, content: res.pieces[i + 2] ?? m.content }));
       const summary = redactionSummary(res.found);
       if (summary) {
         view.webview.postMessage({ type: 'notice', text: `🛡 Redacted before sending: ${summary}.` });
@@ -924,6 +1227,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const maxTokens = cfg.get<number>('chat.maxTokens', 8192);
     const agent = this.mode === 'agent';
     const plan = this.mode === 'plan';
+    const permissionMode = agent && provider.permissionModes ? this.permissionMode : undefined;
     let cliBin: string | undefined;
     if (provider.id === 'claude-code') {
       cliBin = cfg.get<string>('chat.claudePath');
@@ -931,24 +1235,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       cliBin = cfg.get<string>('chat.codexPath');
     } else if (provider.id === 'opencode') {
       cliBin = cfg.get<string>('chat.opencodePath');
+    } else if (provider.id === 'grok') {
+      cliBin = cfg.get<string>('chat.grokPath');
+    } else if (provider.id === 'cursor') {
+      cliBin = cfg.get<string>('chat.cursorPath');
     }
 
-    // Resume the CLI session only if it belongs to the current provider; otherwise start fresh.
-    const resumeId =
-      this.session.cliSessionProvider === provider.id ? this.session.cliSessionId : undefined;
+    // A provider/model/mode switch keeps the sema transcript but starts a compatible
+    // native CLI run. Codex resume otherwise retains an old model and sandbox.
+    const resumeId = compatibleCliSession(
+      this.session,
+      provider.id,
+      this.modelId,
+      this.mode,
+      permissionMode,
+    );
     let assistant = '';
     try {
       await provider.stream({
         apiKey,
         cwd: this.repoRoot,
         cliBin,
+        cliWsl: this.codexWsl(),
         agent,
         plan,
-        semaBin: cfg.get<string>('binaryPath') || 'sema',
+        semaBin: this.useIndex ? cfg.get<string>('binaryPath') || 'sema' : undefined,
         // Only providers that declare an effort argument get one.
         effort: provider.efforts ? this.effort : undefined,
+        permissionMode,
         model: this.modelId,
-        system: buildSystem(outContext, provider.readsWorkspace, this.mode),
+        system: buildSystem(
+          outContext,
+          provider.readsWorkspace,
+          this.mode,
+          activePlan,
+          this.session.planPath,
+          this.useIndex,
+        ),
         messages: outMessages,
         attachmentsDir: this.attachmentsDir,
         maxTokens,
@@ -957,6 +1280,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         onSession: (id) => {
           this.session.cliSessionId = id;
           this.session.cliSessionProvider = provider.id;
+          this.session.cliSessionModel = this.modelId;
+          this.session.cliSessionMode = this.mode;
+          this.session.cliSessionPermission = permissionMode;
         },
         onModel: (m) => {
           view.webview.postMessage({ type: 'model', model: m });
@@ -970,9 +1296,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         },
         onThinking: (t) => view.webview.postMessage({ type: 'thinking', text: t }),
         onActivity: (tool, detail) => view.webview.postMessage({ type: 'activity', tool, detail }),
+        onPermissionRequest: (request) => this.requestPermission(request),
         onUsage: (u) => this.recordUsage(u),
       });
       this.history.push({ role: 'assistant', content: assistant });
+      if (plan && assistant.trim() && !this.controller.signal.aborted) {
+        try {
+          const artifact = await savePlanArtifact(
+            this.repoRoot,
+            this.session.id,
+            titleFromMessages(this.history),
+            assistant,
+          );
+          this.session.planPath = artifact.relativePath;
+          view.webview.postMessage({
+            type: 'notice',
+            text: `Plan saved to ${artifact.relativePath}. Switch to Agent mode to execute it.`,
+          });
+        } catch (e) {
+          view.webview.postMessage({
+            type: 'error',
+            message: `sema: could not save the plan: ${(e as Error).message}`,
+          });
+        }
+      }
     } catch (err) {
       if (this.controller.signal.aborted) {
         // User stopped — keep the partial reply as a real turn.
@@ -983,6 +1330,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.history.pop();
         this.session.cliSessionId = undefined;
         this.session.cliSessionProvider = undefined;
+        this.session.cliSessionModel = undefined;
+        this.session.cliSessionMode = undefined;
+        this.session.cliSessionPermission = undefined;
         // The turn is gone, so put its text and files back in the composer — otherwise
         // the chips are already cleared and the attachments are unrecoverable.
         this.pending = attachments;
@@ -1092,6 +1442,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   #brand svg { width: 18px; height: 18px; color: var(--vscode-foreground); }
   #brand .name { font-size: 13px; letter-spacing: .3px; }
   #modelinfo { flex: 1; text-align: right; font-size: 11px; color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Sign-in / API-key warning. Hidden unless the active provider can't send. */
+  #authnotice { display: none; align-items: center; gap: 5px; flex: none; padding: 2px 8px; border-radius: 10px; font-size: 11px; cursor: pointer;
+    color: var(--vscode-inputValidation-warningForeground, var(--vscode-editorWarning-foreground));
+    background: var(--vscode-inputValidation-warningBackground, transparent);
+    border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground)); }
+  #authnotice.show { display: inline-flex; }
+  #authnotice:hover { background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); }
+  #authnotice svg { width: 12px; height: 12px; flex: none; }
   .iconbtn { width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: none; border-radius: 6px; background: transparent; color: var(--vscode-foreground); cursor: pointer; opacity: .75; flex: none; }
   .iconbtn:hover { background: var(--vscode-list-hoverBackground); opacity: 1; }
 
@@ -1104,7 +1462,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   #empty .sub { font-size: 12px; color: var(--vscode-descriptionForeground); max-width: 280px; line-height: 1.55; }
 
   .msg { margin-bottom: 12px; }
-  .msg .bubble { padding: 9px 12px; border-radius: 10px; white-space: normal; word-wrap: break-word; line-height: 1.5; }
+  .msg .bubble { padding: 9px 12px; border-radius: 10px; white-space: normal; word-wrap: break-word; overflow-wrap: anywhere; min-width: 0; max-width: 100%; line-height: 1.5; }
   .msg.user { display: flex; justify-content: flex-end; }
   .msg.user .bubble { background: var(--vscode-textBlockQuote-background); border: 1px solid var(--vscode-panel-border); max-width: 88%; }
   .msg.assistant .bubble { background: transparent; padding-left: 2px; padding-right: 2px; }
@@ -1136,6 +1494,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   details.think summary { cursor: pointer; user-select: none; }
   .think-body { white-space: pre-wrap; font-style: italic; opacity: .85; padding: 4px 0 4px 10px; }
   .notice { text-align: center; font-size: 11px; color: var(--vscode-descriptionForeground); padding: 4px 0; }
+  .permission-card { margin: 7px 0; padding: 10px; border: 1px solid var(--vscode-editorWarning-foreground, var(--vscode-panel-border)); border-radius: 9px; background: var(--vscode-textBlockQuote-background); color: var(--vscode-foreground); font-family: var(--vscode-font-family); }
+  .permission-head { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; }
+  .permission-icon { color: var(--vscode-editorWarning-foreground, #d7a500); font-size: 15px; line-height: 1; }
+  .permission-detail { margin-top: 7px; color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family); font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .permission-actions { display: flex; align-items: center; gap: 7px; margin-top: 10px; }
+  .permission-actions button { border: 1px solid var(--vscode-button-border, transparent); border-radius: 5px; padding: 4px 12px; font-family: inherit; font-size: 11.5px; cursor: pointer; }
+  .permission-actions button:disabled { cursor: default; opacity: .65; }
+  .permission-allow { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  .permission-allow:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+  .permission-reject { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  .permission-reject:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
+  .permission-state { margin-left: auto; color: var(--vscode-descriptionForeground); font-size: 11px; }
+  .permission-card.allowed { border-color: var(--vscode-testing-iconPassed, var(--vscode-editorInfo-foreground)); }
+  .permission-card.denied { border-color: var(--vscode-testing-iconFailed, var(--vscode-editorError-foreground)); }
   #status { padding: 2px 12px; min-height: 14px; font-size: 11px; color: var(--vscode-descriptionForeground); }
 
   #composer { margin: 0 10px 10px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 12px; background: var(--vscode-input-background); padding: 8px; display: flex; flex-direction: column; gap: 8px; }
@@ -1151,23 +1523,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .chip .x:hover { background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); color: var(--vscode-foreground); }
   .msg .chips { margin-top: 6px; justify-content: flex-end; }
   #input { resize: none; background: transparent; color: var(--vscode-input-foreground); border: none; outline: none; padding: 2px 4px; font-family: inherit; font-size: var(--vscode-font-size); line-height: 1.5; max-height: 160px; overflow-y: auto; }
-  #toolbar { display: flex; align-items: center; gap: 6px; }
-  #controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: 1; min-width: 0; }
-  #controls select { background: transparent; color: var(--vscode-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 6px; padding: 3px 6px; font-size: 11.5px; cursor: pointer; max-width: 160px; }
-  #controls select:hover { border-color: var(--vscode-focusBorder); }
-  #controls button { background: transparent; color: var(--vscode-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 6px; padding: 3px 8px; font-size: 11.5px; cursor: pointer; }
-  #controls button:hover { border-color: var(--vscode-focusBorder); }
-  #controls button.warn { color: var(--vscode-editorWarning-foreground); border-color: var(--vscode-editorWarning-foreground); }
-  #controls button.ok { color: var(--vscode-testing-iconPassed, var(--vscode-foreground)); }
+  #toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 6px; min-width: 0; }
+  #controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+  #controls .spacer { flex: 1; min-width: 0; }
+  #submit-row { display: flex; align-items: flex-end; justify-content: flex-end; min-width: 0; }
+  /* Round icon buttons (attachments) */
+  .roundbtn { position: relative; width: 28px; height: 28px; min-width: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 999px; background: transparent; color: var(--vscode-foreground); cursor: pointer; flex: none; }
+  .roundbtn:hover { border-color: var(--vscode-focusBorder); background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); }
+  .roundbtn.open { border-color: var(--vscode-focusBorder); }
+  .roundbtn svg { width: 15px; height: 15px; }
+  .roundbtn .dot, .pill .dot { position: absolute; top: 1px; right: 1px; width: 7px; height: 7px; border-radius: 50%; background: var(--vscode-editorWarning-foreground, #d7a500); border: 1.5px solid var(--vscode-input-background); display: none; }
+  .roundbtn.needs .dot, .pill.needs .dot { display: block; }
+  /* Focused controls for sema, mode, provider/model, and permissions. */
+  .pill { position: relative; display: inline-flex; align-items: center; gap: 5px; max-width: 170px; padding: 4px 10px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 999px; background: transparent; color: var(--vscode-foreground); font-size: 11.5px; cursor: pointer; flex: none; }
+  .pill:hover { border-color: var(--vscode-focusBorder); background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); }
+  .pill.open { border-color: var(--vscode-focusBorder); }
+  .pill .cap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pill .caret { flex: none; opacity: .6; }
+  .sema-pill svg:not(.caret) { width: 13px; height: 13px; flex: none; }
+  .access-indicator { display: none; align-items: center; gap: 5px; padding: 4px 7px; border: none; border-radius: 5px; background: transparent; color: var(--vscode-foreground); font-family: inherit; font-size: 11.5px; cursor: pointer; white-space: nowrap; }
+  .access-indicator:hover { background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); }
+  .access-indicator svg { width: 13px; height: 13px; flex: none; }
+  .access-indicator.danger { color: var(--vscode-editorWarning-foreground, #e85d3f); }
+  #modelpill { min-width: 0; }
   #send { width: 30px; height: 30px; min-width: 30px; padding: 0; border: none; border-radius: 8px; background: var(--vscode-foreground); color: var(--vscode-editor-background); cursor: pointer; display: flex; align-items: center; justify-content: center; flex: none; }
   #send:hover { opacity: .82; }
-  .switch { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; font-size: 11.5px; color: var(--vscode-foreground); }
-  .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
-  .switch .track { position: relative; width: 26px; height: 15px; border-radius: 999px; background: var(--vscode-dropdown-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); transition: background .15s, border-color .15s; flex: none; }
-  .switch .track::after { content: ''; position: absolute; top: 1px; left: 1px; width: 11px; height: 11px; border-radius: 50%; background: var(--vscode-descriptionForeground); transition: transform .15s, background .15s; }
-  .switch input:checked + .track { background: var(--vscode-foreground); border-color: var(--vscode-foreground); }
-  .switch input:checked + .track::after { transform: translateX(11px); background: var(--vscode-editor-background); }
-  .switch input:focus-visible + .track { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+  /* Popover menus */
+  .menu { position: fixed; z-index: 50; min-width: 180px; max-width: 300px; max-height: 340px; overflow-y: auto; padding: 4px; border: 1px solid var(--vscode-menu-border, var(--vscode-input-border, var(--vscode-panel-border))); border-radius: 8px; background: var(--vscode-menu-background, var(--vscode-dropdown-background)); color: var(--vscode-menu-foreground, var(--vscode-foreground)); box-shadow: 0 4px 16px rgba(0, 0, 0, .32); }
+  .menu-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 5px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .menu-item:hover { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); color: var(--vscode-menu-selectionForeground, inherit); }
+  .menu-item .check { width: 13px; flex: none; text-align: center; opacity: 0; font-size: 11px; }
+  .menu-item.on .check, .menu-item.sel .check { opacity: 1; }
+  .menu-item .mtext { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .menu-item .mhint { flex: none; font-size: 10.5px; color: var(--vscode-descriptionForeground); }
+  .menu-sep { height: 1px; margin: 4px 6px; background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border)); }
+  .menu-label { padding: 5px 8px 2px; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--vscode-descriptionForeground); }
 
   /* ── History browser (session list overlay) ── */
   #histpanel { display: none; position: absolute; inset: 0; z-index: 5; flex-direction: column; background: var(--vscode-sideBar-background, var(--vscode-editor-background)); }
@@ -1179,13 +1569,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   #histnew:hover { opacity: .82; }
   #histsearch { margin: 0 12px 8px; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); background: var(--vscode-input-background); color: var(--vscode-input-foreground); outline: none; font-family: inherit; font-size: 12px; }
   #histsearch:focus { border-color: var(--vscode-focusBorder); }
-  #histlist { flex: 1; overflow-y: auto; padding: 0 8px 10px; }
+  #histlist { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0 8px 10px; }
   #histempty { display: none; padding: 24px 16px; text-align: center; font-size: 12px; color: var(--vscode-descriptionForeground); line-height: 1.6; }
-  .hist-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+  .hist-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px; cursor: pointer; min-width: 0; }
   .hist-item:hover { background: var(--vscode-list-hoverBackground); }
   .hist-item.active { background: var(--vscode-list-inactiveSelectionBackground); }
   .hist-main { flex: 1; min-width: 0; }
-  .hist-title { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hist-title { font-size: 12.5px; overflow-wrap: anywhere; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
   .hist-meta { font-size: 10.5px; color: var(--vscode-descriptionForeground); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .hist-time { font-size: 10.5px; color: var(--vscode-descriptionForeground); flex: none; }
   .hist-del { flex: none; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: none; border-radius: 5px; background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; opacity: 0; }
@@ -1197,6 +1587,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div id="header">
     <span id="brand"><svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="0.4" stroke-linejoin="round"><path d="M8.06 3.83 L22.00 3.83 L17.55 8.38 L16.37 9.46 L14.92 9.92 L2.40 9.92 L2.23 9.63 L2.79 7.95 L4.01 6.00 L5.82 4.52 L8.03 3.86 Z"></path><path d="M10.60 12.43 L21.01 12.43 L21.14 13.25 L20.65 15.23 L19.00 17.93 L17.26 19.31 L14.82 20.14 L2.00 20.17 L8.92 13.15 L10.57 12.46 Z"></path></svg><span class="name">sema</span></span>
     <span id="modelinfo" title="Selected model id (→ marks the model a local CLI actually used)"></span>
+    <span id="authnotice" role="button" tabindex="0"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><path d="M12 9v4M12 17h.01"></path></svg><span class="txt"></span></span>
     <button id="history" class="iconbtn" title="Chat history"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"></path><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"></path><path d="M12 7v5l4 2"></path></svg></button>
     <button id="clear" class="iconbtn" title="New chat (current chat is saved to history)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"></path></svg></button>
   </div>
@@ -1216,7 +1607,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div id="empty">
       <div class="logo"><svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="0.4" stroke-linejoin="round"><path d="M8.06 3.83 L22.00 3.83 L17.55 8.38 L16.37 9.46 L14.92 9.92 L2.40 9.92 L2.23 9.63 L2.79 7.95 L4.01 6.00 L5.82 4.52 L8.03 3.86 Z"></path><path d="M10.60 12.43 L21.01 12.43 L21.14 13.25 L20.65 15.23 L19.00 17.93 L17.26 19.31 L14.82 20.14 L2.00 20.17 L8.92 13.15 L10.57 12.46 Z"></path></svg></div>
       <div class="title">sema</div>
-      <div class="sub">Chat with your codebase. Pick a provider below, then <b>Ask</b> a question, let it <b>Plan</b>, or switch to <b>Agent</b> to make changes.</div>
+      <div class="sub">Chat with your codebase. <b>Ask</b> a question, let it <b>Plan</b>, or switch to <b>Agent</b> to make changes. Pick a provider &amp; model from the controls below.</div>
     </div>
   </div>
   <div id="status"></div>
@@ -1225,21 +1616,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <textarea id="input" rows="1" placeholder="Ask about your codebase…   (Enter to send · Shift+Enter for newline)"></textarea>
     <div id="toolbar">
       <div id="controls">
-        <button id="attach" title="Attach a file (or paste / drop one here)">📎</button>
-        <select id="provider" title="Provider"></select>
-        <select id="model" title="Model"></select>
-        <select id="mode" title="Ask = read-only Q&amp;A · Plan = propose a plan (no edits) · Agent = make changes">
-          <option value="ask">Ask</option>
-          <option value="plan">Plan</option>
-          <option value="agent">Agent</option>
-        </select>
-        <select id="effort" title="Reasoning effort"></select>
-        <label id="indexswitch" class="switch" title="Use sema's semantic index as extra context (like Cursor's codebase context)"><span>index</span><input type="checkbox" id="indexchk"><span class="track"></span></label>
-        <label id="redactswitch" class="switch" title="Redact PII &amp; secrets (emails, API keys, names, locations…) before sending to the model"><span>redact</span><input type="checkbox" id="redactchk"><span class="track"></span></label>
-        <button id="setkey" title="Set API key">Set key</button>
-        <button id="loginbtn" title="Sign in to the selected CLI (Claude Code / Codex)">Log in</button>
+        <button id="plusbtn" class="roundbtn" title="Attach a file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"></path></svg></button>
+        <button id="semabtn" class="pill sema-pill" title="Sema index, redaction, management and updates"><svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="0.4" stroke-linejoin="round"><path d="M8.06 3.83 L22.00 3.83 L17.55 8.38 L16.37 9.46 L14.92 9.92 L2.40 9.92 L2.23 9.63 L2.79 7.95 L4.01 6.00 L5.82 4.52 L8.03 3.86 Z"></path><path d="M10.60 12.43 L21.01 12.43 L21.14 13.25 L20.65 15.23 L19.00 17.93 L17.26 19.31 L14.82 20.14 L2.00 20.17 L8.92 13.15 L10.57 12.46 Z"></path></svg><span class="cap">Sema</span><svg class="caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <button id="modepill" class="pill" title="Ask = read-only Q&amp;A · Plan = propose a plan (no edits) · Agent = make changes"><span class="cap">Ask</span><svg class="caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <span class="spacer"></span>
+        <button id="permissionpill" class="access-indicator" title="Require approval — click to change permissions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v5c0 5-3.4 8.5-8 10-4.6-1.5-8-5-8-10V6l8-3z"></path><path d="M9 12l2 2 4-4"></path></svg><span>Approval</span><svg class="caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <button id="modelpill" class="pill" title="Provider, model and reasoning effort"><span class="cap">default</span><svg class="caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg><span class="dot"></span></button>
       </div>
-      <button id="send" title="Send"></button>
+      <div id="submit-row">
+        <button id="send" title="Send"></button>
+      </div>
     </div>
   </div>
   <script nonce="${nonce}">
@@ -1249,20 +1635,84 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     var statusEl = document.getElementById('status');
     var input = document.getElementById('input');
     var sendBtn = document.getElementById('send');
-    var providerSel = document.getElementById('provider');
-    var modelSel = document.getElementById('model');
-    var modeSel = document.getElementById('mode');
-    var effortSel = document.getElementById('effort');
-    var setkeyBtn = document.getElementById('setkey');
-    var loginBtn = document.getElementById('loginbtn');
-    var loggedInState = false;
+    var plusBtn = document.getElementById('plusbtn');
+    var semaBtn = document.getElementById('semabtn');
+    var modePill = document.getElementById('modepill');
+    var permissionPill = document.getElementById('permissionpill');
+    var modelPill = document.getElementById('modelpill');
     var modelInfo = document.getElementById('modelinfo');
-    var curDefaults = {}, curProvider = '';
-    function modelIdOf(model){ if (!model || model === '__custom__') return ''; if (model === 'default' && curDefaults[curProvider]) return curDefaults[curProvider]; return model; }
+    var authNotice = document.getElementById('authnotice');
+    // Single source of truth for every composer control — the pills and popover
+    // menus are rebuilt from this on each 'config' / 'auth' message.
+    var state = {
+      providers: [], provider: '', model: 'default', mode: 'agent', effort: 'default', permission: 'ask',
+      defaults: {}, useIndex: false, redact: false,
+      requiresKey: false, hasKey: false, canLogin: false, loggedIn: false,
+      // Provider id the loggedIn verdict was resolved for. Sign-in state is discovered
+      // by running the CLI, so it lands one message after 'config' — until this matches
+      // the active provider we don't know it, and must not tell someone who is signed
+      // in to sign in. Keyed by provider (not a bare pending flag) so a re-sent
+      // 'config' for the same provider keeps the verdict we already have.
+      authFor: '',
+    };
+    function providerOf(id){ for (var i=0;i<state.providers.length;i++){ if (state.providers[i].id === id) return state.providers[i]; } return null; }
+    function effortsFor(p, model){
+      if (!p) return [];
+      var infos = p.modelInfos || [];
+      for (var i=0;i<infos.length;i++){
+        if (infos[i].id === model && infos[i].efforts) return infos[i].efforts;
+      }
+      return p.efforts || [];
+    }
+    function modelIdOf(model){ if (!model || model === '__custom__') return ''; if (model === 'default' && state.defaults[state.provider]) return state.defaults[state.provider]; return model; }
     function showSelectedModel(model){ modelInfo.textContent = modelIdOf(model); }
+    // Friendly label for the model pill: the model's display name, else its id.
+    function modelLabel(){
+      var p = providerOf(state.provider);
+      if (p){ var infos = p.modelInfos || []; for (var i=0;i<infos.length;i++){ if (infos[i].id === state.model) return infos[i].name || infos[i].id; } }
+      return state.model || 'default';
+    }
+    function modeLabel(){ return state.mode ? state.mode.charAt(0).toUpperCase() + state.mode.slice(1) : 'Ask'; }
+    // Reflect current state onto the always-visible pills / buttons.
+    function refreshPills(){
+      modePill.querySelector('.cap').textContent = modeLabel();
+      var activeProvider = providerOf(state.provider);
+      var cap = modelPill.querySelector('.cap'); cap.textContent = modelLabel();
+      var needs = (state.requiresKey && !state.hasKey)
+        || (state.canLogin && state.authFor === state.provider && !state.loggedIn);
+      var hasPermissionControl = activeProvider && activeProvider.permissionModes && activeProvider.permissionModes.length;
+      var fullAccess = state.permission === 'bypass';
+      permissionPill.style.display = state.mode === 'agent' && hasPermissionControl ? 'inline-flex' : 'none';
+      permissionPill.querySelector('span').textContent = fullAccess ? 'Full access' : 'Approval';
+      permissionPill.classList.toggle('danger', fullAccess);
+      permissionPill.title = fullAccess
+        ? 'Full access is enabled — click to change permissions'
+        : 'Require approval is enabled — click to change permissions';
+      semaBtn.title = 'Sema index: ' + (state.useIndex ? 'on' : 'off') + ' · Redaction: ' + (state.redact ? 'on' : 'off');
+      modelPill.classList.toggle('needs', needs);
+      modelPill.title = needs
+        ? (state.requiresKey && !state.hasKey ? 'Set an API key to send' : 'Sign in to send')
+        : (activeProvider ? activeProvider.label + ' · ' : '') + 'Model: ' + modelIdOf(state.model) + (state.effort !== 'default' ? ' · Effort: ' + state.effort : '');
+      refreshAuthNotice(activeProvider, needs);
+      showSelectedModel(state.model);
+    }
+    // Surface "can't send yet" in the header, where it is visible before the user
+    // types — the model pill only reveals it once its menu is open. Naming the
+    // provider matters: the reason is per-provider, and switching provider changes it.
+    function refreshAuthNotice(activeProvider, needs){
+      // Plain split, not a regex: this script is emitted from a template literal, so a
+      // backslash escape here silently becomes something else by the time it runs.
+      var name = activeProvider ? activeProvider.label.split(' (local)')[0] : 'this provider';
+      var keyMissing = state.requiresKey && !state.hasKey;
+      authNotice.classList.toggle('show', !!needs);
+      if (!needs) return;
+      authNotice.querySelector('.txt').textContent = keyMissing ? 'Set API key' : 'Sign in';
+      authNotice.title = keyMissing
+        ? name + ' needs an API key before it can answer — click to set it.'
+        : 'Not signed in to ' + name + ' — click to sign in with its own CLI.';
+    }
     var composerEl = document.getElementById('composer');
     var chipsEl = document.getElementById('chips');
-    var attachBtn = document.getElementById('attach');
     var ICON_IMAGE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><path d="M21 15l-5-5L5 21"></path></svg>';
     var ICON_PDF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path></svg>';
     var ICON_TEXT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6"></path><path d="M8 13h8M8 17h5"></path></svg>';
@@ -1300,7 +1750,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       items.forEach(function(a){ row.appendChild(makeChip(a, null)); });
       return row;
     }
-    attachBtn.addEventListener('click', function(){ vscode.postMessage({type:'attach'}); });
     // Paste is the one route with no path — the bytes only exist in page context.
     input.addEventListener('paste', function(e){
       var files = (e.clipboardData && e.clipboardData.files) || [];
@@ -1339,10 +1788,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         })(files[i]);
       }
     });
-    var indexChk = document.getElementById('indexchk');
-    var useIndex = false;
-    function applyIndexBtn(){ indexChk.checked = useIndex; }
-    var redactChk = document.getElementById('redactchk');
     var emptyEl = document.getElementById('empty');
     function hideEmpty(){ if (emptyEl){ emptyEl.style.display = 'none'; } }
     function autogrow(){ input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; }
@@ -1434,6 +1879,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       b.textContent = content;
       if (attachments && attachments.length){ b.appendChild(attachRow(attachments)); }
     }
+    var permissionCards = {};
+    function resolvePermissionCard(id, decision){
+      var card = permissionCards[id];
+      if (!card) return;
+      var buttons = card.querySelectorAll('button');
+      for (var i=0;i<buttons.length;i++) buttons[i].disabled = true;
+      card.classList.add(decision === 'allow' ? 'allowed' : 'denied');
+      var result = card.querySelector('.permission-state');
+      if (result) result.textContent = decision === 'allow' ? 'Allowed' : 'Rejected';
+      delete permissionCards[id];
+      statusEl.textContent = '';
+    }
+    function renderPermissionRequest(m){
+      hideEmpty();
+      var request = m.request || {};
+      var card = document.createElement('section'); card.className = 'permission-card';
+      var head = document.createElement('div'); head.className = 'permission-head';
+      var icon = document.createElement('span'); icon.className = 'permission-icon'; icon.textContent = '⚠'; head.appendChild(icon);
+      var title = document.createElement('span'); title.textContent = request.title || 'Agent permission required'; head.appendChild(title); card.appendChild(head);
+      var detailParts = [];
+      if (request.tool) detailParts.push('Action: ' + request.tool);
+      if (request.detail) detailParts.push(String(request.detail));
+      if (detailParts.length){ var detail=document.createElement('div'); detail.className='permission-detail'; detail.textContent=detailParts.join('\\n\\n'); card.appendChild(detail); }
+      var actions = document.createElement('div'); actions.className = 'permission-actions';
+      var allow = document.createElement('button'); allow.className = 'permission-allow'; allow.textContent = 'Allow';
+      var reject = document.createElement('button'); reject.className = 'permission-reject'; reject.textContent = 'Reject';
+      var result = document.createElement('span'); result.className = 'permission-state'; result.textContent = 'Waiting for your decision';
+      function decide(decision){
+        allow.disabled = true; reject.disabled = true; result.textContent = 'Applying decision…';
+        vscode.postMessage({type:'permissionDecision', id:String(m.id || ''), decision:decision});
+      }
+      allow.addEventListener('click', function(){ decide('allow'); });
+      reject.addEventListener('click', function(){ decide('deny'); });
+      actions.appendChild(allow); actions.appendChild(reject); actions.appendChild(result); card.appendChild(actions);
+      permissionCards[String(m.id || '')] = card;
+      if (curEl){ ensureStructure(); traceEl.appendChild(card); } else { messagesEl.appendChild(card); }
+      statusEl.textContent = 'Waiting for permission…';
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
     var ICON_SEND = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V7"></path><path d="M6.5 12.5 L12 7 L17.5 12.5"></path></svg>';
     var ICON_STOP = '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="3"></rect></svg>';
     function setStreaming(on){ streaming = on; sendBtn.innerHTML = on ? ICON_STOP : ICON_SEND; sendBtn.title = on ? 'Stop' : 'Send'; }
@@ -1448,14 +1932,143 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     messagesEl.addEventListener('click', function(e){ var a = e.target && e.target.closest ? e.target.closest('a[href]') : null; if (a){ e.preventDefault(); vscode.postMessage({type:'openLink', url:a.getAttribute('href')}); } });
     input.addEventListener('keydown', function(e){ if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); doSend(); } });
     input.addEventListener('input', autogrow);
-    providerSel.addEventListener('change', function(){ vscode.postMessage({type:'setProvider', provider:providerSel.value}); });
-    modelSel.addEventListener('change', function(){ if (modelSel.value === '__custom__'){ vscode.postMessage({type:'customModel'}); } else { showSelectedModel(modelSel.value); vscode.postMessage({type:'setModel', model:modelSel.value}); } });
-    modeSel.addEventListener('change', function(){ vscode.postMessage({type:'setMode', mode:modeSel.value}); });
-    effortSel.addEventListener('change', function(){ vscode.postMessage({type:'setEffort', effort:effortSel.value}); });
-    indexChk.addEventListener('change', function(){ useIndex = indexChk.checked; vscode.postMessage({type:'setIndex', value:useIndex}); });
-    redactChk.addEventListener('change', function(){ vscode.postMessage({type:'setRedact', value:redactChk.checked}); });
-    setkeyBtn.addEventListener('click', function(){ vscode.postMessage({type:'setKey'}); });
-    loginBtn.addEventListener('click', function(){ vscode.postMessage({type: loggedInState ? 'logout' : 'login'}); });
+    // ── popover menus ──────────────────────────────────────────────────────
+    // One reusable menu at a time, anchored above its trigger (the composer sits at
+    // the bottom of the panel). Items are a flat spec list — see the builders below.
+    var openMenu = null, openAnchor = null;
+    function closeMenu(){
+      if (openMenu){ openMenu.remove(); openMenu = null; }
+      if (openAnchor){ openAnchor.classList.remove('open'); openAnchor = null; }
+    }
+    function onDocMouseDown(e){ if (openMenu && !openMenu.contains(e.target) && (!openAnchor || !openAnchor.contains(e.target))){ closeMenu(); } }
+    document.addEventListener('mousedown', onDocMouseDown, true);
+    document.addEventListener('keydown', function(e){ if (e.key === 'Escape' && openMenu){ closeMenu(); } });
+    window.addEventListener('resize', closeMenu);
+    // items: {text, hint, on, sel, check, keepOpen, action} | {sep:true} | {label:'…'}
+    function showMenu(anchor, align, items){
+      var wasThis = openAnchor === anchor;
+      closeMenu();
+      if (wasThis) return; // clicking the open trigger again just closes it
+      var menu = document.createElement('div'); menu.className = 'menu';
+      items.forEach(function(it){
+        if (it.sep){ var s = document.createElement('div'); s.className = 'menu-sep'; menu.appendChild(s); return; }
+        if (it.label !== undefined){ var l = document.createElement('div'); l.className = 'menu-label'; l.textContent = it.label; menu.appendChild(l); return; }
+        var el = document.createElement('div'); el.className = 'menu-item' + (it.on ? ' on' : '') + (it.sel ? ' sel' : '');
+        if (it.check || it.sel){ var ck = document.createElement('span'); ck.className = 'check'; ck.textContent = '✓'; el.appendChild(ck); }
+        var t = document.createElement('span'); t.className = 'mtext'; t.textContent = it.text; el.appendChild(t);
+        if (it.hint){ var h = document.createElement('span'); h.className = 'mhint'; h.textContent = it.hint; el.appendChild(h); }
+        el.addEventListener('click', function(ev){
+          ev.stopPropagation();
+          if (it.keepOpen){ if (it.action) it.action(el); }
+          else { closeMenu(); if (it.action) it.action(el); }
+        });
+        menu.appendChild(el);
+      });
+      document.body.appendChild(menu);
+      var r = anchor.getBoundingClientRect();
+      var mw = menu.offsetWidth, mh = menu.offsetHeight, pad = 8;
+      var left = align === 'right' ? r.right - mw : r.left;
+      left = Math.max(pad, Math.min(left, window.innerWidth - mw - pad));
+      var top = r.top - mh - 6;
+      if (top < pad) top = r.bottom + 6; // no room above → drop below
+      menu.style.left = left + 'px'; menu.style.top = top + 'px';
+      openMenu = menu; openAnchor = anchor; anchor.classList.add('open');
+    }
+
+    // + is attachments only. Sema owns all index, redaction and maintenance actions.
+    plusBtn.addEventListener('click', function(){ vscode.postMessage({type:'attach'}); });
+    semaBtn.addEventListener('click', function(){
+      showMenu(semaBtn, 'left', [
+        { text: 'Use sema index', hint: 'codebase context', check: true, on: state.useIndex, keepOpen: true,
+          action: function(el){ state.useIndex = !state.useIndex; el.classList.toggle('on', state.useIndex); refreshPills(); vscode.postMessage({type:'setIndex', value: state.useIndex}); } },
+        { text: 'Redact PII & secrets', hint: 'before sending', check: true, on: state.redact, keepOpen: true,
+          action: function(el){ state.redact = !state.redact; el.classList.toggle('on', state.redact); refreshPills(); vscode.postMessage({type:'setRedact', value: state.redact}); } },
+        { sep: true },
+        { text: 'Manage sema…', hint: 'index, setup & doctor', action: function(){ vscode.postMessage({type:'manage'}); } },
+        { text: 'Update agent CLIs…', hint: 'Claude, Codex & opencode', action: function(){ vscode.postMessage({type:'updateAgents'}); } },
+      ]);
+    });
+
+    // Mode pill: Ask / Plan / Agent.
+    modePill.addEventListener('click', function(){
+      var modes = [
+        { id: 'ask', text: 'Ask', hint: 'read-only' },
+        { id: 'plan', text: 'Plan', hint: 'propose, no edits' },
+        { id: 'agent', text: 'Agent', hint: 'make changes' },
+      ];
+      showMenu(modePill, 'left', modes.map(function(md){
+        return { text: md.text, hint: md.hint, sel: state.mode === md.id,
+          action: function(){ state.mode = md.id; refreshPills(); vscode.postMessage({type:'setMode', mode: md.id}); } };
+      }));
+    });
+
+    // Model control: provider, model, provider-specific effort, and authentication.
+    modelPill.addEventListener('click', function(){
+      var p = providerOf(state.provider); if (!p) return;
+      var infos = p.modelInfos && p.modelInfos.length ? p.modelInfos : (p.models || []).map(function(id){ return {id:id, name:id}; });
+      var items = [{ label: 'Provider' }], lastSection = null;
+      state.providers.forEach(function(provider){
+        items.push({ text: provider.label, sel: provider.id === state.provider,
+          action: function(){ state.provider = provider.id; refreshPills(); vscode.postMessage({type:'setProvider', provider: provider.id}); } });
+      });
+      items.push({ sep: true }, { label: 'Model' });
+      infos.forEach(function(mi){
+        var sec = mi.section || '';
+        if (sec && sec !== lastSection){ items.push({ label: sec }); lastSection = sec; }
+        var label = mi.name || mi.id;
+        if (mi.id === 'default' && state.defaults[state.provider]){ label = (mi.name || 'Default') + ' (' + state.defaults[state.provider] + ')'; }
+        items.push({ text: label, hint: mi.recommended ? '★' : '', sel: mi.id === state.model,
+          action: function(){
+            state.model = mi.id;
+            var validEfforts = effortsFor(p, mi.id);
+            if (validEfforts.indexOf(state.effort) < 0){
+              state.effort = 'default';
+              vscode.postMessage({type:'setEffort', effort:'default'});
+            }
+            refreshPills();
+            vscode.postMessage({type:'setModel', model: mi.id});
+          } });
+      });
+      items.push({ text: '+ Custom model id…', action: function(){ vscode.postMessage({type:'customModel'}); } });
+      var efforts = effortsFor(p, state.model);
+      if (efforts.length > 1){
+        items.push({ sep: true }, { label: 'Reasoning effort' });
+        efforts.forEach(function(ef){
+          var lbl = ef === 'xhigh' ? 'extra high' : ef;
+          items.push({ text: lbl, sel: ef === state.effort,
+            action: function(){ state.effort = ef; refreshPills(); vscode.postMessage({type:'setEffort', effort: ef}); } });
+        });
+      }
+      if (state.requiresKey || state.canLogin){ items.push({ sep: true }); }
+      if (state.requiresKey){
+        items.push({ text: state.hasKey ? 'Change API key' : 'Set API key', hint: state.hasKey ? 'set' : 'required',
+          action: function(){ vscode.postMessage({type:'setKey'}); } });
+      }
+      if (state.canLogin){
+        items.push({ text: state.loggedIn ? 'Sign out' : 'Sign in', hint: state.loggedIn ? 'signed in' : 'required',
+          action: function(){ vscode.postMessage({type: state.loggedIn ? 'logout' : 'login'}); } });
+      }
+      showMenu(modelPill, 'right', items);
+    });
+
+    // Permissions are intentionally separate from model/provider configuration.
+    permissionPill.addEventListener('click', function(){
+      showMenu(permissionPill, 'right', [
+        { label: 'Permissions' },
+        { text: 'Require approval', hint: 'ask before protected actions', sel: state.permission === 'ask',
+          action: function(){ state.permission = 'ask'; refreshPills(); vscode.postMessage({type:'setPermission', permission:'ask'}); } },
+        { text: 'Bypass permissions', hint: 'danger: unrestricted access', sel: state.permission === 'bypass',
+          action: function(){ state.permission = 'bypass'; refreshPills(); vscode.postMessage({type:'setPermission', permission:'bypass'}); } },
+      ]);
+    });
+    // The notice is the shortcut for whichever step is actually missing.
+    function runAuthNoticeAction(){
+      vscode.postMessage({ type: (state.requiresKey && !state.hasKey) ? 'setKey' : 'login' });
+    }
+    authNotice.addEventListener('click', runAuthNoticeAction);
+    authNotice.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); runAuthNoticeAction(); }
+    });
     document.getElementById('clear').addEventListener('click', function(){ vscode.postMessage({type:'clear'}); });
 
     // ── history browser (session list overlay) ──
@@ -1508,46 +2121,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', function(ev){
       var m = ev.data;
       if (m.type === 'config'){
-        curProvider = m.provider; curDefaults = m.defaults || {};
-        providerSel.innerHTML = '';
-        m.providers.forEach(function(p){ var o = document.createElement('option'); o.value = p.id; o.textContent = p.label; if (p.id === m.provider) o.selected = true; providerSel.appendChild(o); });
-        var cur = m.providers.filter(function(p){ return p.id === m.provider; })[0];
-        modelSel.innerHTML = '';
-        if (cur){
-          var infos = cur.modelInfos || (cur.models||[]).map(function(id){ return {id:id, name:id}; });
-          var order = [], bySection = {};
-          infos.forEach(function(mi){ var s = mi.section || ''; if (!(s in bySection)){ bySection[s] = []; order.push(s); } bySection[s].push(mi); });
-          function makeOption(mi){
-            var o = document.createElement('option'); o.value = mi.id;
-            var label = mi.name || mi.id;
-            if (mi.id === 'default' && m.defaults && m.defaults[m.provider]){ label = (mi.name || 'Default') + ' (' + m.defaults[m.provider] + ')'; }
-            o.textContent = label;
-            if (mi.description){ o.title = mi.description; }
-            if (mi.id === m.model){ o.selected = true; }
-            return o;
-          }
-          order.forEach(function(s){
-            if (s){ var og = document.createElement('optgroup'); og.label = s; bySection[s].forEach(function(mi){ og.appendChild(makeOption(mi)); }); modelSel.appendChild(og); }
-            else { bySection[s].forEach(function(mi){ modelSel.appendChild(makeOption(mi)); }); }
-          });
-          var co = document.createElement('option'); co.value = '__custom__'; co.textContent = '+ custom id…'; modelSel.appendChild(co);
-        }
-        if (m.mode) { modeSel.value = m.mode; }
-        effortSel.innerHTML = '';
-        var efforts = (cur && cur.efforts) ? cur.efforts : [];
-        efforts.forEach(function(ef){ var o = document.createElement('option'); o.value = ef; var lbl = ef === 'xhigh' ? 'extra high' : ef; o.textContent = 'effort: ' + lbl; if (ef === m.effort) o.selected = true; effortSel.appendChild(o); });
-        effortSel.style.display = efforts.length > 1 ? '' : 'none';
-        if (typeof m.useIndex === 'boolean'){ useIndex = m.useIndex; applyIndexBtn(); }
-        if (typeof m.redact === 'boolean'){ redactChk.checked = m.redact; }
-        if (m.requiresKey) {
-          setkeyBtn.style.display = '';
-          setkeyBtn.textContent = m.hasKey ? 'Key set' : 'Set key';
-          setkeyBtn.className = m.hasKey ? 'ok' : 'warn';
-        } else {
-          setkeyBtn.style.display = 'none';
-        }
-        if (!m.canLogin){ loginBtn.style.display = 'none'; loggedInState = false; } else { loginBtn.style.display = ''; }
-        showSelectedModel(m.model);
+        // Fold the config into local state; every pill/menu reads from it.
+        state.providers = m.providers || [];
+        state.provider = m.provider; state.model = m.model;
+        state.defaults = m.defaults || {};
+        if (m.mode) state.mode = m.mode;
+        if (m.effort) state.effort = m.effort;
+        if (m.permission) state.permission = m.permission;
+        if (typeof m.useIndex === 'boolean') state.useIndex = m.useIndex;
+        if (typeof m.redact === 'boolean') state.redact = m.redact;
+        state.requiresKey = !!m.requiresKey;
+        state.hasKey = !!m.hasKey;
+        state.canLogin = !!m.canLogin;
+        if (!m.canLogin) state.loggedIn = false;
+        refreshPills();
       } else if (m.type === 'userMessage'){ hideEmpty(); renderMessage('user', m.text, m.attachments); }
       else if (m.type === 'attachments'){ renderPending(m.items); }
       else if (m.type === 'restoreInput'){ input.value = m.text || ''; autogrow(); }
@@ -1556,13 +2143,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       else if (m.type === 'assistantStart'){ hideEmpty(); if (revealTimer && answerEl && shownLen < answerRaw.length){ answerEl.innerHTML = render(answerRaw); } if (revealTimer){ clearInterval(revealTimer); revealTimer = null; } curEl = addBubble('assistant'); curEl.innerHTML = '<span class="typing"><span></span><span></span><span></span></span>'; answerEl=null; traceEl=null; answerRaw=''; thinkBody=null; started=false; shownLen=0; setStreaming(true); statusEl.textContent = ''; }
       else if (m.type === 'thinking'){ ensureStructure(); if (!thinkBody){ var dt=document.createElement('details'); dt.className='think'; dt.open=true; var sm=document.createElement('summary'); sm.textContent='Thinking'; dt.appendChild(sm); thinkBody=document.createElement('div'); thinkBody.className='think-body'; dt.appendChild(thinkBody); traceEl.appendChild(dt); } thinkBody.textContent += m.text; messagesEl.scrollTop = messagesEl.scrollHeight; }
       else if (m.type === 'activity'){ ensureStructure(); var ac=document.createElement('div'); ac.className='act'; ac.textContent = '⚙ ' + m.tool + (m.detail ? '  ' + m.detail : ''); traceEl.appendChild(ac); messagesEl.scrollTop = messagesEl.scrollHeight; }
+      else if (m.type === 'permissionRequest'){ renderPermissionRequest(m); }
+      else if (m.type === 'permissionResolved'){ resolvePermissionCard(String(m.id || ''), m.decision === 'allow' ? 'allow' : 'deny'); }
       else if (m.type === 'delta'){ ensureStructure(); answerRaw += m.text; startReveal(); }
       else if (m.type === 'assistantEnd'){ if (curEl && !started){ curEl.textContent = '(no output)'; } statusEl.textContent = ''; setStreaming(false); curEl = null; }
       else if (m.type === 'error'){ hideEmpty(); if (curEl && !started){ var ew = curEl.parentNode; if (ew && ew.parentNode){ ew.parentNode.removeChild(ew); } curEl = null; } addBubble('error').textContent = m.message; setStreaming(false); statusEl.textContent = ''; }
-      else if (m.type === 'clear'){ messagesEl.innerHTML = ''; if (revealTimer){ clearInterval(revealTimer); revealTimer = null; } curEl = null; answerEl = null; setStreaming(false); statusEl.textContent = ''; if (emptyEl){ emptyEl.style.display = ''; } showSelectedModel(modelSel.value); }
+      else if (m.type === 'clear'){ messagesEl.innerHTML = ''; permissionCards = {}; if (revealTimer){ clearInterval(revealTimer); revealTimer = null; } curEl = null; answerEl = null; setStreaming(false); statusEl.textContent = ''; if (emptyEl){ emptyEl.style.display = ''; } showSelectedModel(state.model); }
       else if (m.type === 'sessions'){ sessionsCache = m.sessions || []; activeSessionId = m.activeId || ''; renderSessions(); }
       else if (m.type === 'restore'){
-        messagesEl.innerHTML = ''; if (revealTimer){ clearInterval(revealTimer); revealTimer = null; }
+        messagesEl.innerHTML = ''; permissionCards = {}; if (revealTimer){ clearInterval(revealTimer); revealTimer = null; }
         curEl = null; answerEl = null; traceEl = null; answerRaw = ''; thinkBody = null; started = false; shownLen = 0; setStreaming(false); statusEl.textContent = '';
         if (m.messages && m.messages.length){ hideEmpty(); m.messages.forEach(function(x){ renderMessage(x.role, x.content, x.attachments); }); }
         else if (emptyEl){ emptyEl.style.display = ''; }
@@ -1571,7 +2160,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       else if (m.type === 'historyClose'){ closeHistory(); }
       else if (m.type === 'model'){ modelInfo.textContent = '→ ' + m.model; }
       else if (m.type === 'notice'){ hideEmpty(); var nt=document.createElement('div'); nt.className='notice'; nt.textContent = m.text; messagesEl.appendChild(nt); messagesEl.scrollTop = messagesEl.scrollHeight; }
-      else if (m.type === 'auth'){ if (!m.canLogin){ loginBtn.style.display='none'; loggedInState=false; } else { loginBtn.style.display=''; loggedInState=!!m.loggedIn; loginBtn.textContent = m.loggedIn ? '✓ Signed in' : 'Log in'; loginBtn.className = m.loggedIn ? 'ok' : 'warn'; loginBtn.title = m.loggedIn ? 'Signed in — click to sign out' : 'Sign in to the selected CLI (Claude Code / Codex)'; } }
+      else if (m.type === 'auth'){
+        // Ignore a verdict that raced a provider switch — it describes the old one.
+        if (m.provider && m.provider !== state.provider) return;
+        state.canLogin = !!m.canLogin; state.loggedIn = m.canLogin ? !!m.loggedIn : false;
+        state.authFor = m.provider || state.provider;
+        refreshPills();
+      }
     });
 
     setStreaming(false);

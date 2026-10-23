@@ -40,8 +40,9 @@ details.ctx { font-size: 11px; color: var(--vscode-descriptionForeground); margi
 .ctx-item { font-family: var(--vscode-editor-font-family); font-size: 11.5px; padding: 2px 0; }
 #composer { margin: 0 10px 10px; border: 1px solid var(--vscode-panel-border); border-radius: 12px; background: var(--vscode-input-background); padding: 8px; display: flex; flex-direction: column; gap: 8px; }
 #input { color: var(--vscode-descriptionForeground); padding: 2px 4px; }
-#toolbar { display: flex; align-items: center; gap: 6px; }
-#controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: 1; }
+#toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 6px; min-width: 0; }
+#controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+#submit-row { display: flex; align-items: flex-end; justify-content: flex-end; min-width: 0; }
 #controls .chip { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 3px 8px; font-size: 11.5px; }
 #controls .chip.ok { color: var(--vscode-testing-iconPassed); }
 .switch { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; }
@@ -83,7 +84,7 @@ details.ctx { font-size: 11px; color: var(--vscode-descriptionForeground); margi
         <label class="switch">index<span class="track"></span></label>
         <span class="chip ok">Key set</span>
       </div>
-      <span id="send"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V7"></path><path d="M6.5 12.5 L12 7 L17.5 12.5"></path></svg></span>
+      <div id="submit-row"><span id="send"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V7"></path><path d="M6.5 12.5 L12 7 L17.5 12.5"></path></svg></span></div>
     </div>
   </div>
 </body></html>

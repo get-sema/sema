@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { SemaClient, SessionUsage } from './semaClient';
 import { ChatViewProvider } from './chatPanel';
-import { ManageViewProvider } from './manageView';
+import { ManagePanel } from './manageView';
 import { StatusBar } from './statusBar';
 
 let watchProc: ChildProcess | undefined;
@@ -35,8 +35,21 @@ export function activate(context: vscode.ExtensionContext): void {
   const binaryPath = (): string =>
     vscode.workspace.getConfiguration('sema').get<string>('binaryPath', 'sema');
 
-  const makeClient = (): SemaClient | undefined =>
-    workspaceRoot ? new SemaClient(binaryPath(), workspaceRoot) : undefined;
+  // One client per workspace keeps sema's local embedding worker warm. Creating a
+  // client per command would reload SBERT and add several seconds to every search.
+  let semaClientPath = binaryPath();
+  let semaClient = workspaceRoot ? new SemaClient(semaClientPath, workspaceRoot) : undefined;
+  context.subscriptions.push({ dispose: () => semaClient?.dispose() });
+  const makeClient = (): SemaClient | undefined => {
+    if (!workspaceRoot) return undefined;
+    const currentPath = binaryPath();
+    if (!semaClient || currentPath !== semaClientPath) {
+      semaClient?.dispose();
+      semaClientPath = currentPath;
+      semaClient = new SemaClient(currentPath, workspaceRoot);
+    }
+    return semaClient;
+  };
 
   const requireWorkspace = (): boolean => {
     if (!workspaceRoot) {
@@ -61,6 +74,17 @@ export function activate(context: vscode.ExtensionContext): void {
   const statusBar = new StatusBar(makeClient);
   context.subscriptions.push(statusBar.disposable);
   void statusBar.refresh();
+  // External `sema index` runs do not emit a VS Code event. Poll lightly and refresh
+  // on focus so the status bar cannot keep showing a stale snapshot after the index
+  // is already fresh. A save refreshes the opposite transition (fresh -> stale).
+  const statusTimer = setInterval(() => void statusBar.refresh(), 30_000);
+  context.subscriptions.push(
+    { dispose: () => clearInterval(statusTimer) },
+    vscode.window.onDidChangeWindowState((state) => {
+      if (state.focused) void statusBar.refresh();
+    }),
+    vscode.workspace.onDidSaveTextDocument(() => void statusBar.refresh()),
+  );
 
   // Running token/cost totals for the active chat session — shared by the chat
   // (writer, reset on New chat) and the Manage view (reader).
@@ -73,21 +97,20 @@ export function activate(context: vscode.ExtensionContext): void {
     turns: 0,
   };
 
-  // ── Manage view (status / paths / registration + one-click actions) ────────
-  const manageProvider = new ManageViewProvider(
+  // ── Manage panel (status / paths / registration + one-click actions) ───────
+  // Opened on demand from the chat title-bar "Manage" button — a QuickPick, not an
+  // always-open sidebar tree. It reads status fresh each time, so there is nothing to
+  // keep refreshed here beyond the status bar.
+  const managePanel = new ManagePanel(
     makeClient,
     workspaceRoot,
     binaryPath,
     () => !!watchProc,
     sessionUsage,
   );
-  context.subscriptions.push(
-    vscode.window.registerTreeDataProvider('semaManage', manageProvider),
-  );
 
   const refreshAll = (): void => {
     void statusBar.refresh();
-    manageProvider.refresh();
   };
 
   // ── Chat panel (webview) ───────────────────────────────────────────────────
@@ -136,6 +159,8 @@ export function activate(context: vscode.ExtensionContext): void {
     const lines = out.split('\n').map((s) => s.trim()).filter(Boolean);
     return `sema: ${lines.find((l) => /[✔✗⚠–]/.test(l)) ?? lines[lines.length - 1] ?? 'done'}`;
   };
+
+  const shellQuote = (value: string): string => `'${value.replace(/'/g, `'"'"'`)}'`;
 
   context.subscriptions.push(
     vscode.commands.registerCommand('sema.openResult', openResult),
@@ -228,6 +253,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
     vscode.commands.registerCommand('sema.chat.setKey', () => chatProvider.promptForKey()),
     vscode.commands.registerCommand('sema.chat.clear', () => chatProvider.clearConversation()),
+    // "sema: Open Chat" in the command palette — reveals the sidebar chat view.
+    // `semaChat.focus` is auto-registered by VS Code for the contributed view and
+    // resolves it on first open, so this works even before the panel is created.
+    vscode.commands.registerCommand('sema.chat.open', () =>
+      vscode.commands.executeCommand('semaChat.focus'),
+    ),
     // Explorer context menu passes (clickedUri, selectedUris); the palette passes neither,
     // in which case fall back to the native picker.
     vscode.commands.registerCommand(
@@ -240,6 +271,72 @@ export function activate(context: vscode.ExtensionContext): void {
       },
     ),
     vscode.commands.registerCommand('sema.manage.refresh', () => refreshAll()),
+    vscode.commands.registerCommand('sema.manage.open', () => managePanel.open()),
+
+    vscode.commands.registerCommand('sema.manage.updateAgents', async () => {
+      if (!requireWorkspace()) return;
+      const pick = await vscode.window.showQuickPick(
+        [
+          {
+            label: 'All installed agents',
+            provider: undefined,
+            detail: 'Claude Code, Codex, opencode, and Grok Build',
+          },
+          { label: 'Claude Code', provider: 'claude' },
+          { label: 'Codex', provider: 'codex' },
+          { label: 'opencode', provider: 'opencode' },
+          { label: 'Grok Build', provider: 'grok' },
+        ],
+        {
+          title: 'Update coding-agent CLIs',
+          placeHolder: 'Re-runs each agent’s official install script in a terminal',
+        },
+      );
+      if (!pick) return;
+      const provider = pick.provider ? ` --provider ${pick.provider}` : '';
+      const terminal = vscode.window.createTerminal({ name: 'sema · update agents', cwd: workspaceRoot });
+      terminal.show();
+      terminal.sendText(`${shellQuote(binaryPath())} update${provider}`);
+      vscode.window.showInformationMessage(
+        'Agent updater started. Reload VS Code after it finishes to refresh available models.',
+      );
+    }),
+
+    // Update sema itself (the sema-mcp package / `sema` CLI) to the latest release.
+    // Run the package-manager upgrade directly — NOT `sema self-update` — so it works
+    // even when the installed sema predates that command. `uv tool` is the one-liner
+    // installer's method; pipx is the documented fallback.
+    vscode.commands.registerCommand('sema.manage.updateSema', () => {
+      const terminal = vscode.window.createTerminal({ name: 'sema · update', cwd: workspaceRoot });
+      terminal.show();
+      terminal.sendText('uv tool upgrade sema-mcp || pipx upgrade sema-mcp');
+      vscode.window.showInformationMessage(
+        'Updating sema… reload VS Code after it finishes to load the new version.',
+      );
+    }),
+
+    vscode.commands.registerCommand('sema.manage.copyInstall', async () => {
+      const cmd =
+        'curl -fsSL https://raw.githubusercontent.com/get-sema/sema/main/install.sh | sh';
+      await vscode.env.clipboard.writeText(cmd);
+      const pick = await vscode.window.showInformationMessage(
+        'Install command copied. Paste it into a terminal (macOS / Linux), then reload the window.',
+        'Open Terminal',
+        'Install guide',
+      );
+      if (pick === 'Open Terminal') {
+        vscode.window.createTerminal('sema install').show();
+      } else if (pick === 'Install guide') {
+        vscode.env.openExternal(
+          vscode.Uri.parse('https://github.com/get-sema/sema/blob/main/docs/installation.md'),
+        );
+      }
+    }),
+    vscode.commands.registerCommand('sema.manage.openInstallDocs', () =>
+      vscode.env.openExternal(
+        vscode.Uri.parse('https://github.com/get-sema/sema/blob/main/docs/installation.md'),
+      ),
+    ),
 
     vscode.commands.registerCommand('sema.manage.reindex', () =>
       runCli('sema: indexing…', (c) => c.index(), { toast: () => 'sema: index updated.' }),
@@ -273,6 +370,18 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand('sema.manage.unregisterCodex', () =>
       runCli('sema: unregistering Codex…', (c) => c.register('codex', true), { toast: initToast }),
+    ),
+    vscode.commands.registerCommand('sema.manage.registerGrok', () =>
+      runCli('sema: registering Grok Build…', (c) => c.register('grok', false), { toast: initToast }),
+    ),
+    vscode.commands.registerCommand('sema.manage.unregisterGrok', () =>
+      runCli('sema: unregistering Grok Build…', (c) => c.register('grok', true), { toast: initToast }),
+    ),
+    vscode.commands.registerCommand('sema.manage.registerCursor', () =>
+      runCli('sema: registering Cursor…', (c) => c.register('cursor', false), { toast: initToast }),
+    ),
+    vscode.commands.registerCommand('sema.manage.unregisterCursor', () =>
+      runCli('sema: unregistering Cursor…', (c) => c.register('cursor', true), { toast: initToast }),
     ),
 
     vscode.commands.registerCommand('sema.manage.doctor', () =>

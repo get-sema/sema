@@ -1,23 +1,99 @@
 # Installation
 
+sema runs on **macOS and Linux**. It needs **Python 3.11+** — the one-line
+installer bootstraps one for you if you don't have it.
+
 ## Requirements
 
-- Python 3.11 or higher
-- One of:
+- macOS or Linux
+- Python 3.11 or higher (installer can provide it via [uv](https://docs.astral.sh/uv/))
+- ~80MB disk for the embedding model (downloaded once, cached globally)
+- One AI assistant to point sema at:
   - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) or [Claude Code VS Code extension](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code)
-  - [Codex VS Code extension](https://marketplace.visualstudio.com/items?itemName=openai.chatgpt) or [OpenAI Codex CLI](https://github.com/openai/codex)
-- ~80MB disk space for the embedding model (downloaded once, cached globally)
-- No Docker, no external APIs, no GPU — runs entirely on your machine
+  - [OpenAI Codex CLI](https://github.com/openai/codex) or [Codex VS Code extension](https://marketplace.visualstudio.com/items?itemName=openai.chatgpt)
+  - [opencode](opencode.md)
+  - [Grok Build](grok.md) or [Cursor](cursor.md)
+  - or sema's own [VS Code extension](../vscode-extension/README.md)
+- No Docker, no external APIs, no GPU — everything runs on your machine
 
-## Install
+## Three ways to install
+
+Pick the one that fits — each part works on its own.
+
+| Path | You get | Steps |
+|---|---|---|
+| **Full sema** | The index *and* the chat panel | CLI installer → `sema index` / `sema setup` → extension |
+| **Just the extension** | The multi-provider chat panel only | Install the extension; the index is optional |
+| **Just the index** | Semantic search for Claude Code / Codex, no editor extension | CLI installer → `sema index` / `sema setup` |
+
+### Just the extension
+
+Want the multi-provider chat panel and nothing else? Skip the CLI entirely.
 
 ```bash
-pip install sema-mcp
+code --install-extension MasihMoloodian.sema-codebase-chat
 ```
 
-This installs the `sema` command. With uv: `uv tool install sema-mcp`. Verify with `sema --version`.
+Or search **"sema"** in the Extensions view. Add an API key in the panel and start
+chatting — the index is optional. Full guide: [sema for VS Code](../vscode-extension/README.md).
 
-> On PyPI the distribution is named **`sema-mcp`** (the name `sema` was already taken); the command and the import are both `sema`.
+### Just the index
+
+Want Claude Code / Codex to stop hunting for files, with no editor extension? Do
+the CLI install below (recommended one-liner), then `sema index .` and
+`sema setup` in your project — that's it.
+
+## Install (recommended)
+
+One line — installs the `sema` command (bootstrapping `uv` and a Python for it if
+needed), then offers to register with whichever AI CLIs you have:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/get-sema/sema/main/install.sh | sh
+```
+
+Then, inside each project:
+
+```bash
+cd your-project
+sema index .     # build the local semantic index
+sema setup       # register with every detected client: Claude Code, Codex, opencode, Grok Build, Cursor
+```
+
+Confirm with `sema --version`, and inside your editor type `/mcp` to see
+`✓ sema connected`. Stuck? Run `sema doctor`.
+
+Skip any client with an env var (they pass cleanly through `curl | sh`):
+
+```bash
+SEMA_SKIP_CODEX=1 curl -fsSL https://raw.githubusercontent.com/get-sema/sema/main/install.sh | sh
+```
+
+`SEMA_SKIP_CLAUDE`, `SEMA_SKIP_CODEX`, `SEMA_SKIP_OPENCODE`, `SEMA_YES=1`
+(non-interactive), and `SEMA_NO_SETUP=1` (binary only) are all honoured. The
+installer is [install.sh](https://github.com/get-sema/sema/blob/main/install.sh) — read it first if you like.
+
+## Install manually
+
+Prefer not to pipe to a shell? Install the package directly:
+
+```bash
+uv tool install sema-mcp     # or: pipx install sema-mcp / pip install sema-mcp
+sema --version
+```
+
+Then, per project:
+
+```bash
+cd your-project
+sema index .
+sema setup                   # all detected CLIs at once
+#   ...or one at a time:
+sema init --claude           # or --codex
+```
+
+> On PyPI the distribution is named **`sema-mcp`** (the name `sema` was already
+> taken); the command and the import are both `sema`.
 
 ## Install from source (for development)
 
@@ -27,7 +103,7 @@ This installs the `sema` command. With uv: `uv tool install sema-mcp`. Verify wi
 
 ```bash
 # 1. Clone to wherever you want
-git clone https://github.com/masihmoloodian/sema.git
+git clone https://github.com/get-sema/sema.git
 cd sema
 
 # 2. Create a virtual environment and install
@@ -42,18 +118,17 @@ source ~/.zshrc
 sema --version
 ```
 
-> Step 3 writes the absolute path of your current directory into `~/.zshrc` automatically.
-> For bash: replace `~/.zshrc` with `~/.bashrc`.
+> Step 3 writes the absolute path of your current directory into `~/.zshrc`.
+> For bash, replace `~/.zshrc` with `~/.bashrc`.
 
 ### Using pip
 
 ```bash
-git clone https://github.com/masihmoloodian/sema.git
+git clone https://github.com/get-sema/sema.git
 cd sema
 
 python3 -m venv .venv
-source .venv/bin/activate        # macOS / Linux
-# .venv\Scripts\activate         # Windows
+source .venv/bin/activate
 
 pip install -e ".[dev]"
 
@@ -65,4 +140,4 @@ sema --version
 
 ---
 
-Next: [Claude Code setup](claude-code.md) · [OpenAI Codex setup](codex.md) · [VS Code workspace setup](vscode-workspace.md)
+Next: [Claude Code setup](claude-code.md) · [OpenAI Codex setup](codex.md) · [opencode setup](opencode.md) · [Grok Build setup](grok.md) · [Cursor setup](cursor.md) · [sema for VS Code](../vscode-extension/README.md)

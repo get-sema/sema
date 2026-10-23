@@ -1,8 +1,8 @@
 {
   "name": "sema-codebase-chat",
-  "displayName": "sema — semantic code search & chat",
+  "displayName": "sema \u2014 semantic code search & chat",
   "description": "Semantic code search, reuse checks, and a codebase-aware chat panel (Claude, OpenAI, DeepSeek, OpenRouter, Together AI, AvalAI), powered by the local sema index.",
-  "version": "0.3.0",
+  "version": "0.11.0",
   "publisher": "MasihMoloodian",
   "license": "MIT",
   "icon": "media/icon-128.png",
@@ -11,17 +11,16 @@
   },
   "categories": [
     "Other",
-    "Machine Learning",
+    "AI",
     "Chat"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/masihmoloodian/sema"
+    "url": "https://github.com/get-sema/sema"
   },
   "main": "./out/extension.js",
   "activationEvents": [
-    "onView:semaChat",
-    "onView:semaManage"
+    "onView:semaChat"
   ],
   "contributes": {
     "viewsContainers": {
@@ -39,12 +38,6 @@
           "type": "webview",
           "id": "semaChat",
           "name": "Chat",
-          "icon": "media/icon.svg",
-          "contextualTitle": "sema"
-        },
-        {
-          "id": "semaManage",
-          "name": "Manage",
           "icon": "media/icon.svg",
           "contextualTitle": "sema"
         }
@@ -67,6 +60,11 @@
         "icon": "$(git-compare)"
       },
       {
+        "command": "sema.chat.open",
+        "title": "sema: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
         "command": "sema.chat.setKey",
         "title": "sema: Set chat API key",
         "icon": "$(key)"
@@ -75,6 +73,11 @@
         "command": "sema.chat.clear",
         "title": "sema: Clear chat",
         "icon": "$(clear-all)"
+      },
+      {
+        "command": "sema.manage.open",
+        "title": "sema: Manage",
+        "icon": "$(settings-gear)"
       },
       {
         "command": "sema.manage.reindex",
@@ -100,6 +103,16 @@
         "command": "sema.manage.refresh",
         "title": "sema: Refresh status",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "sema.manage.updateAgents",
+        "title": "sema: Update agent CLIs",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "sema.manage.updateSema",
+        "title": "sema: Update sema",
+        "icon": "$(cloud-download)"
       }
     ],
     "menus": {
@@ -112,24 +125,19 @@
       ],
       "view/title": [
         {
-          "command": "sema.chat.setKey",
+          "command": "sema.manage.open",
           "when": "view == semaChat",
           "group": "navigation@1"
+        },
+        {
+          "command": "sema.chat.setKey",
+          "when": "view == semaChat",
+          "group": "navigation@2"
         },
         {
           "command": "sema.chat.clear",
           "when": "view == semaChat",
-          "group": "navigation@2"
-        },
-        {
-          "command": "sema.manage.reindex",
-          "when": "view == semaManage",
-          "group": "navigation@1"
-        },
-        {
-          "command": "sema.manage.refresh",
-          "when": "view == semaManage",
-          "group": "navigation@2"
+          "group": "navigation@3"
         }
       ]
     },
@@ -161,20 +169,36 @@
           "default": "codex",
           "description": "Path to the Codex CLI (the 'Codex (local)' provider). Set an absolute path if `codex` isn't on VS Code's PATH."
         },
+        "sema.chat.codexUseWsl": {
+          "type": "boolean",
+          "default": false,
+          "description": "Windows only: run the Codex CLI inside WSL (sign-in, status, and chat) instead of natively. Turn on if Codex is installed in your WSL distro rather than on Windows."
+        },
         "sema.chat.opencodePath": {
           "type": "string",
           "default": "opencode",
           "description": "Path to the opencode CLI (the 'opencode (local)' provider). Set an absolute path if `opencode` isn't on VS Code's PATH."
+        },
+        "sema.chat.grokPath": {
+          "type": "string",
+          "default": "grok",
+          "description": "Path to the Grok Build CLI (the 'Grok Build (local)' provider). Set an absolute path if `grok` isn't on VS Code's PATH."
+        },
+        "sema.chat.cursorPath": {
+          "type": "string",
+          "default": "cursor-agent",
+          "description": "Path to the Cursor Agent CLI (the 'Cursor (local)' provider). Set an absolute path if `cursor-agent` isn't on VS Code's PATH."
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run bundle",
+    "vscode:prepublish": "npm run bundle && node scripts/check-bundle.cjs && node scripts/check-webview.cjs",
     "bundle": "node esbuild.js",
     "watch": "node esbuild.js --watch",
     "compile": "tsc -p ./",
-    "test": "esbuild src/*.test.ts --bundle --platform=node --format=cjs --outdir=out/test --external:vscode && node --test \"out/test/*.test.js\"",
+    "test": "esbuild src/*.test.ts src/providers/*.test.ts --bundle --platform=node --format=cjs --outdir=out/test --external:vscode && node --test out/test/*.test.js out/test/providers/*.test.js && npm run test:bundle",
+    "test:bundle": "npm run bundle && node scripts/check-bundle.cjs && node scripts/check-webview.cjs",
     "package": "vsce package"
   },
   "devDependencies": {
@@ -185,6 +209,7 @@
     "typescript": "^5.4.0"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.211",
     "@anthropic-ai/sdk": "^0.111.0",
     "openai": "^6.46.0"
   }

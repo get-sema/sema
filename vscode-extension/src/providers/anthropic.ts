@@ -1,21 +1,28 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { AttachmentKind, ChatMessage, ChatProvider, ModelInfo, StreamOptions } from './types';
-import { AGENT_TOOLS, READONLY_TOOLS, toAnthropicTools, executeTool, toolDetail, ToolContext } from './tools';
+import { toAnthropicTools, executeTool, toolDetail, ToolContext, toolsForMode } from './tools';
 import { readBase64 } from '../attachments';
 
-/** Public list prices (USD per 1M tokens) for cost estimation; unknown models get no estimate. */
-const PRICES: Record<string, { in: number; out: number }> = {
-  'claude-fable-5': { in: 10, out: 50 },
-  'claude-opus-4-8': { in: 5, out: 25 },
-  'claude-opus-4-7': { in: 5, out: 25 },
-  'claude-opus-4-6': { in: 5, out: 25 },
-  'claude-sonnet-5': { in: 3, out: 15 },
-  'claude-sonnet-4-6': { in: 3, out: 15 },
-  'claude-haiku-4-5': { in: 1, out: 5 },
+/**
+ * Public list prices (USD per 1M tokens) for cost estimation, from
+ * platform.claude.com/docs/en/about-claude/pricing; unknown models get no estimate.
+ * `cachedIn` is the cache-hit rate, which is not a fixed fraction of `in` (Fable 5.1
+ * reads cache at 0.025×). Haiku 5.5 uses its ≤100K-token prompt tier.
+ */
+const PRICES: Record<string, { in: number; cachedIn: number; out: number }> = {
+  'claude-fable-5-1': { in: 10, cachedIn: 0.25, out: 50 },
+  'claude-fable-5': { in: 10, cachedIn: 1, out: 50 },
+  'claude-opus-5-5': { in: 4, cachedIn: 0.2, out: 20 },
+  'claude-opus-5': { in: 5, cachedIn: 0.5, out: 25 },
+  'claude-opus-4-8': { in: 5, cachedIn: 0.5, out: 25 },
+  'claude-opus-4-7': { in: 5, cachedIn: 0.5, out: 25 },
+  'claude-opus-4-6': { in: 5, cachedIn: 0.5, out: 25 },
+  'claude-sonnet-5-5': { in: 2, cachedIn: 0.1, out: 10 },
+  'claude-sonnet-5': { in: 2, cachedIn: 0.2, out: 10 },
+  'claude-sonnet-4-6': { in: 3, cachedIn: 0.3, out: 15 },
+  'claude-haiku-5-5': { in: 0.1, cachedIn: 0.01, out: 0.5 },
+  'claude-haiku-4-5': { in: 1, cachedIn: 0.1, out: 5 },
 };
-
-/** Anthropic bills cache-read input at ~0.1× the fresh input rate; approximate that in estimates. */
-const CACHE_READ_MULTIPLIER = 0.1;
 
 /** Cap on agent tool-call rounds per turn — a backstop against a looping model. */
 const MAX_AGENT_STEPS = 50;
@@ -101,24 +108,24 @@ interface UsageTotals {
 export class AnthropicProvider implements ChatProvider {
   readonly id = 'anthropic';
   readonly label = 'Claude (Anthropic)';
-  // Current model IDs; Opus 4.8 is the default per Anthropic guidance.
+  // Current model IDs; Opus 5.5 is the default per Anthropic guidance.
   readonly models = [
+    'claude-opus-5-5',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+    'claude-fable-5-1',
     'claude-opus-4-8',
-    'claude-sonnet-5',
-    'claude-haiku-4-5',
-    'claude-opus-4-7',
-    'claude-fable-5',
   ];
   get modelInfos(): ModelInfo[] {
     return this.models.map((id) => ({ id }));
   }
-  readonly defaultModel = 'claude-opus-4-8';
+  readonly defaultModel = 'claude-opus-5-5';
   // No `efforts`: effort is a Claude Code / Codex CLI flag, not a Messages API parameter.
   readonly requiresKey = true;
   readonly readsWorkspace = false;
   readonly secretKey = 'sema.apiKey.anthropic';
   readonly keyHint = 'console.anthropic.com';
-  readonly modelHint = 'e.g. claude-opus-4-8, claude-sonnet-5, claude-fable-5';
+  readonly modelHint = 'e.g. claude-opus-5-5, claude-sonnet-5-5, claude-fable-5-1';
 
   accepts(): readonly AttachmentKind[] {
     return ACCEPTS;
@@ -163,7 +170,7 @@ export class AnthropicProvider implements ChatProvider {
    */
   private async runAgent(client: Anthropic, opts: StreamOptions): Promise<void> {
     const readOnly = !opts.agent;
-    const tools = toAnthropicTools(readOnly ? READONLY_TOOLS : AGENT_TOOLS);
+    const tools = toAnthropicTools(toolsForMode(readOnly, !!opts.semaBin));
     const ctx: ToolContext = { cwd: opts.cwd || process.cwd(), readOnly, semaBin: opts.semaBin };
     const messages: Anthropic.MessageParam[] = await toMessages(opts.messages, opts.attachmentsDir);
     const totals = newTotals();
@@ -199,17 +206,10 @@ export class AnthropicProvider implements ChatProvider {
         break; // no tools requested → the turn is done
       }
 
-      // Record the assistant's turn (text + tool_use), then execute each call and
-      // append its result. Rebuild as *param* blocks so only text/tool_use are echoed.
-      const assistantContent: Anthropic.ContentBlockParam[] = [];
-      for (const b of msg.content) {
-        if (b.type === 'text') {
-          assistantContent.push({ type: 'text', text: b.text });
-        } else if (b.type === 'tool_use') {
-          assistantContent.push({ type: 'tool_use', id: b.id, name: b.name, input: b.input });
-        }
-      }
-      messages.push({ role: 'assistant', content: assistantContent });
+      // Echo the assistant's turn back verbatim, thinking blocks included: thinking is
+      // always on for the Claude 5.x models, and a tool loop that drops or edits the
+      // thinking ahead of a tool_use is rejected (preserved thinking).
+      messages.push({ role: 'assistant', content: msg.content });
 
       const results: Anthropic.ToolResultBlockParam[] = [];
       for (const tu of toolUses) {
@@ -236,7 +236,7 @@ export class AnthropicProvider implements ChatProvider {
     }
     const price = PRICES[opts.model];
     const costUsd = price
-      ? ((t.input - t.cached) * price.in + t.cached * price.in * CACHE_READ_MULTIPLIER + t.output * price.out) / 1e6
+      ? ((t.input - t.cached) * price.in + t.cached * price.cachedIn + t.output * price.out) / 1e6
       : undefined;
     opts.onUsage({
       inputTokens: t.input,

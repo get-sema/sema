@@ -2,14 +2,35 @@ import { spawn } from 'child_process';
 import { promises as fs, Dirent } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { Attachment, AttachmentKind, ChatMessage, ChatProvider, ModelInfo, StreamOptions, TokenUsage } from './types';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import {
+  Attachment,
+  AttachmentKind,
+  ChatMessage,
+  ChatProvider,
+  ModelInfo,
+  StreamOptions,
+  TokenUsage,
+} from './types';
 import { pathFor } from '../attachments';
+import { resolveCliInvocation } from '../cliRuntime';
 
-/** Flatten the system context + conversation into a single prompt string for a CLI. */
+/**
+ * Flatten the system context + conversation into a single prompt string for a CLI.
+ *
+ * Pass `system` here ONLY for a CLI with no system-prompt channel of its own — today
+ * Codex (`exec`'s positional *is* its instructions) and opencode (`run` has no such
+ * flag). Where a channel exists, send it there and pass '' here: Claude Code takes
+ * `--append-system-prompt`, Grok takes `--rules`. Inlined context reads as if the user
+ * typed it, which is how a bare "hi" comes back answered as though it were about sema.
+ *
+ * When inlining is unavoidable, mark where the context stops so the model can still tell
+ * the user's actual request from the instructions wrapped around it.
+ */
 function flattenPrompt(system: string, messages: ChatMessage[]): string {
   const parts: string[] = [];
   if (system.trim()) {
-    parts.push(system.trim(), '');
+    parts.push(system.trim(), '', '--- End of context. Reply to the request below. ---', '');
   }
   if (messages.length === 1 && messages[0].role === 'user') {
     // Single user turn (the common first-turn case) — pass it through verbatim, with
@@ -97,6 +118,35 @@ function describeTool(tool: string, input: Record<string, unknown>): string {
   }
 }
 
+/** Claude tools that can change the workspace or execute arbitrary commands. */
+export function isClaudeProtectedTool(tool: string): boolean {
+  return ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash'].includes(tool);
+}
+
+/** Phrases each CLI prints when it has no usable credentials. */
+const SIGNED_OUT = /not\s+logged\s*in|not\s+authenticated|logged\s+out|no\s+credentials/i;
+
+/**
+ * Read a CLI's auth-status output and decide whether the user is signed in.
+ *
+ * Each CLI reports this differently and none of them exit non-zero for it:
+ * Claude Code prints JSON with a `loggedIn` field, Codex (`auth list`) and Grok
+ * (`models`) print prose over their normal output. So JSON wins when present, and
+ * everything else falls back to matching the signed-out phrases.
+ */
+export function parseSignedIn(stdout: string): boolean {
+  const out = stdout.trim();
+  try {
+    const parsed = JSON.parse(out) as { loggedIn?: boolean };
+    if (typeof parsed?.loggedIn === 'boolean') {
+      return parsed.loggedIn;
+    }
+  } catch {
+    // Not JSON — every other CLI reports in prose.
+  }
+  return !SIGNED_OUT.test(out);
+}
+
 interface Activity {
   id?: string;
   tool: string;
@@ -156,7 +206,8 @@ abstract class CliProvider implements ChatProvider {
     const exe = opts.cliBin && opts.cliBin.trim() ? opts.cliBin : bin;
 
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(exe, [...args, prompt], {
+      const inv = resolveCliInvocation(this.id, exe, [...args, prompt], !!opts.cliWsl);
+      const child = spawn(inv.executable, inv.args, {
         cwd: opts.cwd || undefined,
         signal: opts.signal,
       });
@@ -291,22 +342,195 @@ export class ClaudeCodeProvider extends CliProvider {
   // Invocation values are the CLI aliases (always resolve to the latest of each tier),
   // with the current version shown as the display name. `claude --model` accepts these.
   readonly modelInfos: ModelInfo[] = [
-    { id: 'default', name: 'Default', description: 'Recommended by Claude Code', recommended: true },
-    { id: 'opus', alias: 'opus', name: 'Opus 4.8' },
-    { id: 'fable', alias: 'fable', name: 'Fable 5' },
-    { id: 'sonnet', alias: 'sonnet', name: 'Sonnet 5' },
-    { id: 'haiku', alias: 'haiku', name: 'Haiku 4.5' },
+    { id: 'opus', alias: 'opus', name: 'Opus 5.5' },
+    { id: 'fable', alias: 'fable', name: 'Fable 5.1' },
+    { id: 'sonnet', alias: 'sonnet', name: 'Sonnet 5.5', recommended: true },
+    { id: 'haiku', alias: 'haiku', name: 'Haiku 5.5' },
   ];
-  readonly defaultModel = 'default';
+  readonly defaultModel = 'sonnet';
   // Mirrors `claude --help`: "--effort <level>  Effort level for the current session
   // (low, medium, high, xhigh, max)". 'max' is Claude-only — Codex rejects it.
   // 'default' means pass no --effort and let the CLI decide.
   readonly efforts = ['default', 'low', 'medium', 'high', 'xhigh', 'max'];
+  readonly permissionModes = ['ask', 'bypass'] as const;
   readonly auth = { login: ['auth', 'login'], logout: ['auth', 'logout'], status: ['auth', 'status'] };
 
   /** Claude Code's Read tool handles images and PDFs as well as text. */
   accepts(): readonly AttachmentKind[] {
     return ['image', 'pdf', 'text'];
+  }
+
+  override async stream(opts: StreamOptions): Promise<void> {
+    if (opts.agent && opts.permissionMode === 'ask') {
+      await this.streamWithApprovals(opts);
+      return;
+    }
+    await super.stream(opts);
+  }
+
+  /** Anthropic's Agent SDK supplies the bidirectional per-tool permission callback. */
+  private async streamWithApprovals(opts: StreamOptions): Promise<void> {
+    const { query: claudeQuery } = await import('@anthropic-ai/claude-agent-sdk');
+    const atts = attachmentsFor(opts);
+    const paths = pathsOf(opts, atts);
+    const prompt = promptWithPaths(
+      { ...opts, system: '' },
+      paths,
+    );
+    const abortController = new AbortController();
+    const abort = (): void => abortController.abort();
+    opts.signal.addEventListener('abort', abort, { once: true });
+    const reported = { session: false, model: false, usage: false };
+    const seenActivities = new Set<string>();
+
+    try {
+      const messages = claudeQuery({
+        prompt,
+        options: {
+          abortController,
+          additionalDirectories: paths.length && opts.attachmentsDir ? [opts.attachmentsDir] : undefined,
+          canUseTool: async (toolName, input, context) => {
+            const decision = opts.onPermissionRequest
+              ? await opts.onPermissionRequest({
+                  provider: 'claude-code',
+                  title: context.title || `Claude Code wants to use ${toolName}`,
+                  detail:
+                    context.description ||
+                    context.decisionReason ||
+                    describeTool(toolName, input) ||
+                    undefined,
+                  tool: toolName,
+                })
+              : 'deny';
+            return decision === 'allow'
+              ? {
+                  behavior: 'allow' as const,
+                  updatedInput: input,
+                  toolUseID: context.toolUseID,
+                  decisionClassification: 'user_temporary' as const,
+                }
+              : {
+                  behavior: 'deny' as const,
+                  message: 'The user rejected this action in sema.',
+                  toolUseID: context.toolUseID,
+                  decisionClassification: 'user_reject' as const,
+                };
+          },
+          hooks: {
+            PreToolUse: [{
+              hooks: [async (input) => {
+                if (
+                  input.hook_event_name !== 'PreToolUse' ||
+                  !isClaudeProtectedTool(input.tool_name)
+                ) {
+                  return {};
+                }
+                const toolInput =
+                  input.tool_input && typeof input.tool_input === 'object'
+                    ? input.tool_input as Record<string, unknown>
+                    : {};
+                const decision = opts.onPermissionRequest
+                  ? await opts.onPermissionRequest({
+                      provider: 'claude-code',
+                      title: `Claude Code wants to use ${input.tool_name}`,
+                      detail: describeTool(input.tool_name, toolInput) || undefined,
+                      tool: input.tool_name,
+                    })
+                  : 'deny';
+                return {
+                  hookSpecificOutput: {
+                    hookEventName: 'PreToolUse' as const,
+                    permissionDecision: decision,
+                    permissionDecisionReason:
+                      decision === 'allow'
+                        ? 'The user allowed this action in sema.'
+                        : 'The user rejected this action in sema.',
+                  },
+                };
+              }],
+            }],
+          },
+          cwd: opts.cwd,
+          effort:
+            opts.effort && opts.effort !== 'default'
+              ? (opts.effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max')
+              : undefined,
+          includePartialMessages: true,
+          model: opts.model && opts.model !== 'default' ? opts.model : undefined,
+          pathToClaudeCodeExecutable: opts.cliBin,
+          permissionMode: 'default',
+          resume: opts.sessionId,
+          skills: 'all',
+          systemPrompt: { type: 'preset', preset: 'claude_code', append: opts.system },
+        },
+      });
+
+      for await (const message of messages) {
+        this.consumeSdkMessage(
+          message,
+          opts,
+          seenActivities,
+          reported,
+        );
+      }
+    } finally {
+      opts.signal.removeEventListener('abort', abort);
+    }
+
+  }
+
+  private consumeSdkMessage(
+    message: SDKMessage,
+    opts: StreamOptions,
+    seenActivities: Set<string>,
+    reported: { session: boolean; model: boolean; usage: boolean },
+  ): void {
+    const event = message as unknown;
+    const session = this.extractSession(event);
+    if (!reported.session && session && opts.onSession) {
+      opts.onSession(session);
+      reported.session = true;
+    }
+    const model = this.extractModel(event);
+    if (!reported.model && model && opts.onModel) {
+      opts.onModel(model);
+      reported.model = true;
+    }
+    const delta = this.extractDelta(event);
+    if (delta) {
+      opts.onDelta(delta);
+    }
+    const thinking = this.extractThinking(event);
+    if (thinking && opts.onThinking) {
+      opts.onThinking(thinking);
+    }
+    if (opts.onActivity) {
+      for (const activity of this.extractActivities(event)) {
+        if (activity.id && seenActivities.has(activity.id)) {
+          continue;
+        }
+        if (activity.id) {
+          seenActivities.add(activity.id);
+        }
+        opts.onActivity(activity.tool, activity.detail);
+      }
+    }
+    const usage = this.extractUsage(event);
+    if (!reported.usage && usage && opts.onUsage) {
+      opts.onUsage(usage);
+      reported.usage = true;
+    }
+    const sdkResult = message as { type?: string; is_error?: boolean; errors?: string[] };
+    if (sdkResult.type === 'result' && sdkResult.is_error && sdkResult.errors?.length) {
+      throw new Error(sdkResult.errors.join('\n'));
+    }
+    const error = this.checkError(event);
+    if (error) {
+      throw new Error(error);
+    }
+    if (sdkResult.type === 'result' && sdkResult.is_error) {
+      throw new Error(sdkResult.errors?.join('\n') || 'Claude Code returned an error.');
+    }
   }
 
   protected buildInvocation(opts: StreamOptions): { bin: string; args: string[]; prompt: string } {
@@ -328,8 +552,13 @@ export class ClaudeCodeProvider extends CliProvider {
       // Plan mode: explore read-only and present a plan; edits are blocked.
       args.push('--permission-mode', 'plan');
     } else if (opts.agent) {
-      // Let it edit files; read-only otherwise (edits are denied non-interactively).
-      args.push('--permission-mode', 'acceptEdits');
+      // Approval mode uses the Agent SDK above. This CLI path is the explicit,
+      // dangerous bypass selected by the user in the extension.
+      args.push('--dangerously-skip-permissions');
+    } else {
+      // Ask is conversational, not an agent run. An empty allow-list prevents Claude
+      // Code from inspecting the workspace despite being an agentic CLI internally.
+      args.push('--tools', '');
     }
     if (opts.model && opts.model !== 'default') {
       args.push('--model', opts.model);
@@ -337,9 +566,15 @@ export class ClaudeCodeProvider extends CliProvider {
     if (opts.effort && opts.effort !== 'default') {
       args.push('--effort', opts.effort);
     }
-    // Fresh: system + full history. Resume: only the new user turn (the session holds
-    // the rest). Attachment paths are appended for whichever set of turns that covers.
-    return { bin: 'claude', args, prompt: promptWithPaths(opts, paths) };
+    // Sema's context belongs in the system prompt, not the user's turn — the same split
+    // the Agent SDK path above already makes via `systemPrompt.append`. Inlined, it reads
+    // as if the user typed it, and "hi" gets answered as if it were about sema.
+    if (opts.system.trim()) {
+      args.push('--append-system-prompt', opts.system);
+    }
+    // Fresh: full history. Resume: only the new user turn (the session holds the rest).
+    // Attachment paths are appended for whichever set of turns that covers.
+    return { bin: 'claude', args, prompt: promptWithPaths({ ...opts, system: '' }, paths) };
   }
 
   protected extractDelta(event: unknown): string | null {
@@ -436,43 +671,363 @@ export class ClaudeCodeProvider extends CliProvider {
 export class CodexProvider extends CliProvider {
   readonly id = 'codex';
   readonly label = 'Codex (local)';
-  // Models per `codex debug models` (Codex CLI 0.133): gpt-5.5 / gpt-5.4 / gpt-5.4-mini.
-  // (gpt-5.6-sol/terra/luna are OpenAI API models — they belong to the `openai` provider,
-  // not the Codex CLI.) 'default' lets Codex pick its own configured model.
-  // Slugs per `codex debug models` (gpt-5.5 / gpt-5.4 / gpt-5.4-mini; codex-auto-review
-  // is an internal review model and is deliberately not offered).
-  //
-  // 'Default' passes no -m and lets Codex choose — which it does server-side, so it can
-  // resolve to a model this CLI doesn't know (currently gpt-5.6-terra, which needs a
-  // newer Codex). Pick an explicit model to pin it.
+  // GPT-6 entries follow developers.openai.com/codex/models (6.1 Sol is the default);
+  // the GPT-5.x levels are as reported by `codex debug models` in CLI 0.144.5. The
+  // panel also discovers the installed CLI's own catalogue at runtime.
+  // codex-auto-review is an internal review model and is deliberately not offered.
   readonly modelInfos: ModelInfo[] = [
-    {
-      id: 'default',
-      name: 'Default',
-      description: "Chosen by Codex server-side; may be newer than your CLI. Pick a model to pin it.",
-      recommended: true,
-    },
-    { id: 'gpt-5.5', name: 'GPT-5.5' },
-    { id: 'gpt-5.4', name: 'GPT-5.4' },
-    { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
+    { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', recommended: true,
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra',
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-6-luna', name: 'GPT-6 Luna',
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol',
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+    { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra',
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+    { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna',
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-5.5', name: 'GPT-5.5', efforts: ['default', 'low', 'medium', 'high', 'xhigh'] },
   ];
-  readonly defaultModel = 'default';
+  readonly defaultModel = 'gpt-6.1-sol';
   // Codex has no --effort flag; effort is config, passed as
   // `-c model_reasoning_effort=<level>`. Parsing locally is not enough to qualify a
-  // level, so each of these was run end-to-end against gpt-5.5:
-  //   none/low/medium/high/xhigh -> answer returned
-  //   minimal                    -> HTTP 400 "The following tools cannot be used with
-  //                                 reasoning.effort 'minimal': image_gen, web_search"
-  // So 'minimal' is omitted: the CLI's parser accepts it, but it is incompatible with
-  // the tools Codex enables, making it a guaranteed failure here. 'none' is kept — it
-  // works, despite `codex debug models` advertising only low/medium/high/xhigh.
-  // Claude Code's 'max' is absent because Codex's parser rejects it outright.
-  readonly efforts = ['default', 'none', 'low', 'medium', 'high', 'xhigh'];
+  // Provider-wide union for custom ids; curated models narrow this via ModelInfo.efforts.
+  readonly efforts = ['default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  readonly permissionModes = ['ask', 'bypass'] as const;
   readonly auth = { login: ['login'], logout: ['logout'], status: ['login', 'status'] };
 
   /** `codex exec` attaches images only (`-i`); its Read tool is text. No PDF path. */
   accepts(): readonly AttachmentKind[] {
     return ['image', 'text'];
+  }
+
+  override async stream(opts: StreamOptions): Promise<void> {
+    if (opts.agent && opts.permissionMode === 'ask') {
+      await this.streamWithApprovals(opts);
+      return;
+    }
+    await super.stream(opts);
+  }
+
+  /** Codex app-server is the official bidirectional transport used by rich clients. */
+  private async streamWithApprovals(opts: StreamOptions): Promise<void> {
+    const exe = opts.cliBin && opts.cliBin.trim() ? opts.cliBin : 'codex';
+    const inv = resolveCliInvocation(this.id, exe, ['app-server'], !!opts.cliWsl);
+    const child = spawn(inv.executable, inv.args, {
+      cwd: opts.cwd || undefined,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+
+    let nextId = 1;
+    let buffer = '';
+    let stderr = '';
+    let settled = false;
+    let lastUsage: TokenUsage | null = null;
+    const pending = new Map<
+      number,
+      { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }
+    >();
+    let finishResolve!: () => void;
+    let finishReject!: (error: Error) => void;
+    const finished = new Promise<void>((resolve, reject) => {
+      finishResolve = resolve;
+      finishReject = reject;
+    });
+
+    const fail = (error: Error): void => {
+      if (!settled) {
+        settled = true;
+        finishReject(error);
+      }
+    };
+    const complete = (): void => {
+      if (!settled) {
+        settled = true;
+        finishResolve();
+      }
+    };
+    const send = (message: Record<string, unknown>): void => {
+      if (!child.stdin.destroyed) {
+        child.stdin.write(`${JSON.stringify(message)}\n`);
+      }
+    };
+    const request = (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        send({ method, id, params });
+      });
+    };
+
+    const decide = async (
+      request: { title: string; detail?: string; tool?: string },
+    ): Promise<'allow' | 'deny'> => {
+      return opts.onPermissionRequest
+        ? opts.onPermissionRequest({ provider: 'codex', ...request })
+        : 'deny';
+    };
+
+    const handleServerRequest = async (message: {
+      id: number | string;
+      method: string;
+      params?: Record<string, unknown>;
+    }): Promise<void> => {
+      const params = message.params ?? {};
+      if (message.method === 'item/commandExecution/requestApproval') {
+        const command = String(params.command ?? '');
+        const cwd = String(params.cwd ?? '');
+        const reason = String(params.reason ?? '');
+        const decision = await decide({
+          title: 'Codex wants to run a command',
+          detail: [command, cwd ? `Working directory: ${cwd}` : '', reason].filter(Boolean).join('\n\n'),
+          tool: command || 'Command execution',
+        });
+        send({ id: message.id, result: { decision: decision === 'allow' ? 'accept' : 'decline' } });
+        return;
+      }
+      if (message.method === 'item/fileChange/requestApproval') {
+        const reason = String(params.reason ?? '');
+        const root = String(params.grantRoot ?? '');
+        const decision = await decide({
+          title: 'Codex wants to modify files',
+          detail: [reason, root ? `Requested write root: ${root}` : ''].filter(Boolean).join('\n\n'),
+          tool: 'File change',
+        });
+        send({ id: message.id, result: { decision: decision === 'allow' ? 'accept' : 'decline' } });
+        return;
+      }
+      if (message.method === 'item/permissions/requestApproval') {
+        const requested = (params.permissions ?? {}) as Record<string, unknown>;
+        const decision = await decide({
+          title: 'Codex wants additional access',
+          detail: String(params.reason ?? '') || JSON.stringify(requested),
+          tool: 'Permission escalation',
+        });
+        send({
+          id: message.id,
+          result: {
+            permissions: decision === 'allow' ? requested : {},
+            scope: 'turn',
+          },
+        });
+        return;
+      }
+      if (message.method === 'execCommandApproval') {
+        const command = Array.isArray(params.command)
+          ? params.command.map(String).join(' ')
+          : String(params.command ?? '');
+        const decision = await decide({
+          title: 'Codex wants to run a command',
+          detail: [command, String(params.reason ?? '')].filter(Boolean).join('\n\n'),
+          tool: command || 'Command execution',
+        });
+        send({ id: message.id, result: { decision: decision === 'allow' ? 'approved' : 'denied' } });
+        return;
+      }
+      if (message.method === 'applyPatchApproval') {
+        const files = Object.keys((params.fileChanges ?? {}) as Record<string, unknown>);
+        const decision = await decide({
+          title: 'Codex wants to modify files',
+          detail: [files.join('\n'), String(params.reason ?? '')].filter(Boolean).join('\n\n'),
+          tool: 'File change',
+        });
+        send({ id: message.id, result: { decision: decision === 'allow' ? 'approved' : 'denied' } });
+        return;
+      }
+      if (message.method === 'item/tool/requestUserInput') {
+        // Sema's composer cannot answer a second, in-flight questionnaire yet. Dismiss
+        // it explicitly so the Codex turn can continue instead of hanging forever.
+        send({ id: message.id, result: { answers: {} } });
+        return;
+      }
+      send({
+        id: message.id,
+        error: { code: -32601, message: `Unsupported Codex app-server request: ${message.method}` },
+      });
+    };
+
+    const handleMessage = (message: Record<string, unknown>): void => {
+      const method = typeof message.method === 'string' ? message.method : '';
+      if (method && message.id !== undefined) {
+        void handleServerRequest(message as {
+          id: number | string;
+          method: string;
+          params?: Record<string, unknown>;
+        }).catch((error: Error) => fail(error));
+        return;
+      }
+      if (typeof message.id === 'number') {
+        const waiter = pending.get(message.id);
+        if (waiter) {
+          pending.delete(message.id);
+          const rpcError = message.error as { message?: string } | undefined;
+          if (rpcError) {
+            waiter.reject(new Error(rpcError.message || 'Codex app-server request failed.'));
+          } else {
+            waiter.resolve((message.result ?? {}) as Record<string, unknown>);
+          }
+          return;
+        }
+      }
+
+      const params = (message.params ?? {}) as Record<string, unknown>;
+      if (method === 'item/agentMessage/delta') {
+        const delta = String(params.delta ?? '');
+        if (delta) {
+          opts.onDelta(delta);
+        }
+      } else if (
+        (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') &&
+        opts.onThinking
+      ) {
+        const delta = String(params.delta ?? '');
+        if (delta) {
+          opts.onThinking(delta);
+        }
+      } else if (method === 'item/started' && opts.onActivity) {
+        const item = (params.item ?? {}) as Record<string, unknown>;
+        if (item.type === 'commandExecution') {
+          opts.onActivity('Run', String(item.command ?? '').slice(0, 60));
+        } else if (item.type === 'fileChange') {
+          opts.onActivity('Edit', '');
+        }
+      } else if (method === 'thread/tokenUsage/updated') {
+        const tokenUsage = (params.tokenUsage ?? {}) as Record<string, unknown>;
+        const last = (tokenUsage.last ?? {}) as Record<string, unknown>;
+        lastUsage = {
+          inputTokens: Number(last.inputTokens ?? 0),
+          outputTokens: Number(last.outputTokens ?? 0) + Number(last.reasoningOutputTokens ?? 0),
+          cachedInputTokens: Number(last.cachedInputTokens ?? 0),
+        };
+      } else if (method === 'turn/completed') {
+        const turn = (params.turn ?? {}) as Record<string, unknown>;
+        if (turn.status === 'failed') {
+          const error = (turn.error ?? {}) as Record<string, unknown>;
+          fail(new Error(String(error.message ?? 'Codex reported a failed turn.')));
+        } else {
+          if (lastUsage && opts.onUsage) {
+            opts.onUsage(lastUsage);
+          }
+          complete();
+        }
+      } else if (method === 'error') {
+        const error = (params.error ?? params) as Record<string, unknown>;
+        fail(new Error(String(error.message ?? 'Codex app-server reported an error.')));
+      }
+    };
+
+    child.stdout.on('data', (chunk: string) => {
+      buffer += chunk;
+      let newline: number;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) {
+          continue;
+        }
+        try {
+          handleMessage(JSON.parse(line) as Record<string, unknown>);
+        } catch {
+          // Ignore non-protocol output; app-server diagnostics are also captured on stderr.
+        }
+      }
+    });
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      fail(
+        error.code === 'ENOENT'
+          ? new Error(`${exe} not found — install it and log in, or set its path in sema settings.`)
+          : error,
+      );
+    });
+    child.on('close', (code) => {
+      if (opts.signal.aborted) {
+        complete();
+      } else if (!settled) {
+        fail(new Error(stderr.trim().split('\n').pop() || `codex app-server exited with code ${code}`));
+      }
+    });
+    const abort = (): void => {
+      // Reject any in-flight request (initialize / thread-start / turn-start) so an
+      // `await request(...)` in the setup phase unblocks. Without this, aborting before
+      // streaming begins hangs forever: the code is awaiting a request that never
+      // settles, so the `finally` that drains `pending` and returns never runs.
+      for (const waiter of pending.values()) {
+        waiter.reject(new Error('Aborted by the user.'));
+      }
+      pending.clear();
+      child.kill();
+      complete();
+    };
+    opts.signal.addEventListener('abort', abort, { once: true });
+
+    try {
+      await request('initialize', {
+        clientInfo: { name: 'sema_vscode', title: 'sema VS Code Extension', version: '0.5.0' },
+      });
+      send({ method: 'initialized', params: {} });
+      const effort = opts.effort && opts.effort !== 'default' ? opts.effort : undefined;
+      const threadParams: Record<string, unknown> = {
+        cwd: opts.cwd,
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        sandbox: 'read-only',
+      };
+      if (opts.model && opts.model !== 'default') {
+        threadParams.model = opts.model;
+      }
+      if (effort) {
+        threadParams.config = { model_reasoning_effort: effort };
+      }
+      if (opts.sessionId) {
+        threadParams.threadId = opts.sessionId;
+      }
+      const threadResult = await request(
+        opts.sessionId ? 'thread/resume' : 'thread/start',
+        threadParams,
+      );
+      const thread = (threadResult.thread ?? {}) as Record<string, unknown>;
+      const threadId = String(thread.id ?? opts.sessionId ?? '');
+      if (!threadId) {
+        throw new Error('Codex app-server did not return a thread id.');
+      }
+      opts.onSession?.(threadId);
+      const resolvedModel = String(threadResult.model ?? '');
+      if (resolvedModel) {
+        opts.onModel?.(resolvedModel);
+      }
+
+      const atts = attachmentsFor(opts);
+      const images = pathsOf(opts, atts, 'image');
+      const prompt = opts.sessionId
+        ? promptOrDefault(opts.messages[opts.messages.length - 1]?.content ?? '', atts)
+        : promptOrDefault(flattenPrompt(opts.system, opts.messages), atts);
+      const input: Array<Record<string, unknown>> = [
+        { type: 'text', text: prompt, text_elements: [] },
+        ...images.map((imagePath) => ({ type: 'localImage', path: imagePath })),
+      ];
+      await request('turn/start', {
+        threadId,
+        input,
+        approvalPolicy: 'on-request',
+        approvalsReviewer: 'user',
+        cwd: opts.cwd,
+        model: opts.model && opts.model !== 'default' ? opts.model : undefined,
+        effort,
+      });
+      await finished;
+    } finally {
+      opts.signal.removeEventListener('abort', abort);
+      for (const waiter of pending.values()) {
+        waiter.reject(new Error('Codex app-server connection closed.'));
+      }
+      pending.clear();
+      child.kill();
+    }
   }
 
   protected buildInvocation(opts: StreamOptions): { bin: string; args: string[]; prompt: string } {
@@ -488,7 +1043,18 @@ export class CodexProvider extends CliProvider {
       // Resume — the session keeps its model/sandbox; send only the new user turn.
       return {
         bin: 'codex',
-        args: ['exec', 'resume', '--json', '--skip-git-repo-check', ...effort, ...images, opts.sessionId],
+        args: [
+          'exec',
+          'resume',
+          '--json',
+          '--skip-git-repo-check',
+          ...(opts.agent && opts.permissionMode === 'bypass'
+            ? ['--dangerously-bypass-approvals-and-sandbox']
+            : []),
+          ...effort,
+          ...images,
+          opts.sessionId,
+        ],
         prompt: promptOrDefault(opts.messages[opts.messages.length - 1]?.content ?? '', atts),
       };
     }
@@ -496,10 +1062,12 @@ export class CodexProvider extends CliProvider {
       'exec',
       '--json',
       '--skip-git-repo-check',
+      ...(opts.agent && opts.permissionMode === 'bypass'
+        ? ['--dangerously-bypass-approvals-and-sandbox']
+        : []),
       ...effort,
       ...images,
-      '--sandbox',
-      opts.agent ? 'workspace-write' : 'read-only',
+      ...(opts.agent && opts.permissionMode === 'bypass' ? [] : ['--sandbox', 'read-only']),
     ];
     if (opts.model && opts.model !== 'default') {
       args.push('-m', opts.model);
@@ -690,16 +1258,17 @@ export class OpenCodeProvider extends CliProvider {
   readonly id = 'opencode';
   readonly label = 'Open Code (local)';
   // Curated subset of `opencode models` (the opencode/ catalog has ~55); "+ custom id…"
-  // reaches the rest. 'default' lets opencode use its own configured model.
-  // `accepts` marks what each model can actually read; entries without one fall back to
-  // image+text. 'default' is text-only — see accepts() below.
+  // reaches the rest. `accepts` marks what each model can actually read; entries without
+  // one fall back to image+text.
   readonly modelInfos: ModelInfo[] = [
-    { id: 'default', name: 'Default', recommended: true, accepts: ['text'] },
+    // Listed in opencode.ai/docs/zen; `opencode models` is the live source of truth.
+    { id: 'opencode/claude-opus-5', name: 'Claude Opus 5', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/claude-opus-4-8', name: 'Claude Opus 4.8', accepts: ['image', 'pdf', 'text'] },
-    { id: 'opencode/claude-sonnet-5', name: 'Claude Sonnet 5', accepts: ['image', 'pdf', 'text'] },
+    { id: 'opencode/claude-sonnet-5', name: 'Claude Sonnet 5', recommended: true, accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/claude-fable-5', name: 'Claude Fable 5', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/claude-haiku-4-5', name: 'Claude Haiku 4.5', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/gpt-5.2-codex', name: 'GPT-5.2 Codex' },
+    { id: 'opencode/gpt-6-astra', name: 'GPT-6 Astra' },
     { id: 'opencode/gpt-5.6-sol', name: 'GPT-5.6 Sol', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/gpt-5.4-mini', name: 'GPT-5.4 Mini' },
     { id: 'opencode/gemini-3.1-pro', name: 'Gemini 3.1 Pro', accepts: ['image', 'pdf', 'text'] },
@@ -712,7 +1281,7 @@ export class OpenCodeProvider extends CliProvider {
     { id: 'opencode/grok-4.5', name: 'Grok 4.5' },
     { id: 'opencode/minimax-m3', name: 'MiniMax M3', accepts: ['text'] },
   ];
-  readonly defaultModel = 'default';
+  readonly defaultModel = 'opencode/claude-sonnet-5';
   // No `efforts`: `opencode run` exposes no reasoning-effort argument.
   readonly modelHint =
     'provider/model — run `opencode models` (e.g. anthropic/claude-sonnet-4-6, openai/gpt-5, opencode/gpt-5.1-codex)';
@@ -723,11 +1292,6 @@ export class OpenCodeProvider extends CliProvider {
    * per-model — opencode is a gateway to ~55 of them, like OpenRouter and Together.
    * Claiming vision for all of them means a silent "I cannot view images" reply from a
    * text-only model instead of an up-front explanation.
-   *
-   * 'default' is treated as text-only on purpose: opencode resolves it from its own
-   * config (commonly a free, text-only model such as opencode/big-pickle) and reports
-   * no model id in its JSON stream, so there is nothing to inspect at runtime. Picking
-   * an explicit model from the dropdown is what unlocks images.
    */
   accepts(model: string): readonly AttachmentKind[] {
     return this.modelInfos.find((m) => m.id === model)?.accepts ?? ['image', 'text'];
@@ -834,5 +1398,283 @@ export class OpenCodeProvider extends CliProvider {
       return e;
     }
     return e?.data?.message ?? e?.message ?? 'opencode returned an error.';
+  }
+}
+
+/**
+ * xAI's Grok Build (`grok`) in headless mode. Prompt is passed via `-p`, so the
+ * trailing positional the base class appends lands as that flag's value.
+ *
+ * `--output-format streaming-json` emits newline-delimited events typed
+ * `text` / `thought` / `end` / `error`. The list is explicitly non-exhaustive and
+ * carries no tool-call event, so this provider reports no activities.
+ */
+export class GrokProvider extends CliProvider {
+  readonly id = 'grok';
+  readonly label = 'Grok Build (local)';
+  // Taken from `grok models` on a signed-in account (grok 0.2.102), which reports
+  // exactly one: "grok-4.5 (default)". xAI's docs still name `grok-build`, but the live
+  // catalog does not list it, so it isn't offered here. The catalog is per-account, so
+  // "+ custom id…" reaches whatever else an account or a custom endpoint exposes.
+  readonly modelInfos: ModelInfo[] = [
+    { id: 'grok-4.5', name: 'Grok 4.5', recommended: true },
+  ];
+  readonly defaultModel = 'grok-4.5';
+  // Mirrors `--reasoning-effort/--effort`: canonical levels none, minimal, low,
+  // medium, high, xhigh, max. `max` is an alias of `xhigh`, so it is not listed twice.
+  readonly efforts = ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+  readonly modelHint = 'grok-4.5 — run `grok models` to list your account’s models';
+  // grok has no dedicated auth-status verb, but `grok models` prints "You are not
+  // authenticated." over the catalog when signed out (and exits 0 either way), which
+  // the shared plain-text sign-in check already recognises. `grok login` opens a
+  // browser; `--device-code` is the headless alternative.
+  readonly auth = { login: ['login'], logout: ['logout'], status: ['models'] };
+
+  /**
+   * Text only. xAI documents no vision capability for the models `grok models` lists,
+   * and claiming it would turn an image attachment into a silent "I cannot view images"
+   * reply rather than an up-front explanation. Text inlines into the prompt, so it works
+   * regardless.
+   */
+  accepts(): readonly AttachmentKind[] {
+    return ['text'];
+  }
+
+  protected buildInvocation(opts: StreamOptions): { bin: string; args: string[]; prompt: string } {
+    const args = ['--output-format', 'streaming-json'];
+    if (opts.cwd) {
+      args.push('--cwd', opts.cwd);
+    }
+    if (opts.sessionId) {
+      args.push('-r', opts.sessionId);
+    }
+    if (opts.model && opts.model !== 'default') {
+      args.push('-m', opts.model);
+    }
+    if (opts.effort && opts.effort !== 'default') {
+      args.push('--effort', opts.effort);
+    }
+    if (opts.agent) {
+      // Auto-approve, or a headless run blocks forever on the first tool prompt.
+      args.push('--yolo');
+    } else {
+      // Ask/Plan stay read-only. The allowlist takes internal tool ids, and grok keeps
+      // the always-on MCP meta-tools on top of it — so sema's tools survive the filter.
+      args.push('--tools', 'read_file,grep,list_dir');
+    }
+    // Sema's context goes to the system prompt, which is what `--rules` appends to, so the
+    // user's turn stays their own words. Inlined instead, it reads as the user's message
+    // and a bare "hi" comes back answered as though it were a question about sema.
+    if (opts.system.trim()) {
+      args.push('--rules', opts.system);
+    }
+    // Fresh: full history. Resume: only the new user turn (the session holds the rest).
+    const prompt = opts.sessionId
+      ? opts.messages[opts.messages.length - 1]?.content ?? ''
+      : flattenPrompt('', opts.messages);
+    // `-p` last: the base class appends the prompt positional, making it this flag's value.
+    args.push('-p');
+    return { bin: 'grok', args, prompt };
+  }
+
+  protected extractDelta(event: unknown): string | null {
+    const o = event as { type?: string; data?: string };
+    return o?.type === 'text' ? o.data ?? null : null;
+  }
+
+  protected extractThinking(event: unknown): string | null {
+    const o = event as { type?: string; data?: string };
+    return o?.type === 'thought' ? o.data ?? null : null;
+  }
+
+  protected extractActivities(): Activity[] {
+    // grok's streaming-json carries no tool-call event.
+    return [];
+  }
+
+  protected extractSession(event: unknown): string | null {
+    const o = event as { type?: string; sessionId?: string };
+    return o?.type === 'end' && typeof o.sessionId === 'string' ? o.sessionId : null;
+  }
+
+  protected extractModel(event: unknown): string | null {
+    const o = event as { type?: string; modelUsage?: Record<string, unknown> };
+    if (o?.type !== 'end' || !o.modelUsage) {
+      return null;
+    }
+    // `end` reports spend per model, keyed by the id actually billed — which resolves
+    // what a selection really mapped to (picking grok-4.5 bills `grok-4.5-build-free`).
+    // Subagents get their own entries with no marker saying which is the main model, so
+    // a single key is the only unambiguous case; otherwise say nothing.
+    const ids = Object.keys(o.modelUsage);
+    return ids.length === 1 ? ids[0] : null;
+  }
+
+  protected extractUsage(event: unknown): TokenUsage | null {
+    const o = event as {
+      type?: string;
+      usage?: {
+        input_tokens?: number;
+        cache_read_input_tokens?: number;
+        output_tokens?: number;
+      };
+      total_cost_usd?: number;
+    };
+    if (o?.type !== 'end' || !o.usage) {
+      return null;
+    }
+    // grok reports `input_tokens` uncached-only, so add the cache hits back to match
+    // TokenUsage.inputTokens (full input, of which cachedInputTokens is the cheap part).
+    // `output_tokens` already includes reasoning tokens — grok's own total_tokens is
+    // input_tokens + cache_read_input_tokens + output_tokens — so don't add them again.
+    const cacheRead = o.usage.cache_read_input_tokens ?? 0;
+    return {
+      inputTokens: (o.usage.input_tokens ?? 0) + cacheRead,
+      outputTokens: o.usage.output_tokens ?? 0,
+      cachedInputTokens: cacheRead,
+      // Absent means unreported or partial, never free — leave it undefined.
+      costUsd: typeof o.total_cost_usd === 'number' ? o.total_cost_usd : undefined,
+    };
+  }
+
+  protected checkError(event: unknown): string | null {
+    const o = event as { type?: string; message?: string };
+    return o?.type === 'error' ? o.message ?? 'Grok Build returned an error.' : null;
+  }
+}
+
+/**
+ * Cursor's headless agent CLI (`cursor-agent`) in print mode. The prompt is the trailing
+ * positional the base class appends; `-p --output-format stream-json` makes it emit
+ * newline-delimited events (`system`/init, `assistant`, `tool_call`, `result`), each
+ * carrying `session_id`. Auth reuses the user's Cursor login (`cursor-agent login`).
+ *
+ * Two documented limits shape this provider: reasoning is suppressed in print mode, and
+ * the stream reports no token usage or cost — so `extractThinking`/`extractUsage` return
+ * null. Model ids come from `cursor-agent --list-models`; `auto` is Cursor's own router.
+ */
+export class CursorProvider extends CliProvider {
+  readonly id = 'cursor';
+  readonly label = 'Cursor (local)';
+  // `auto` is Cursor's router (the CLI default) and always valid; the rest are common
+  // aliases — confirm the live set with `cursor-agent --list-models`. "+ custom id…"
+  // reaches anything else an account exposes.
+  readonly modelInfos: ModelInfo[] = [
+    { id: 'auto', name: 'Auto (Cursor picks)', recommended: true },
+    { id: 'sonnet-4.5', name: 'Claude Sonnet 4.5' },
+    { id: 'sonnet-4.5-thinking', name: 'Claude Sonnet 4.5 (thinking)' },
+    { id: 'opus-4.1', name: 'Claude Opus 4.1' },
+    { id: 'gpt-5', name: 'GPT-5' },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+  ];
+  readonly defaultModel = 'auto';
+  // No `efforts`: cursor-agent exposes no reasoning-effort flag.
+  readonly modelHint = 'auto — run `cursor-agent --list-models` to list your account’s models';
+  readonly auth = { login: ['login'], logout: ['logout'], status: ['status'] };
+
+  /**
+   * Text only. cursor-agent's headless mode documents no image/pdf attachment path, and
+   * claiming vision would turn an attachment into a silent "I can't see it" reply. Text
+   * inlines into the prompt, so it works regardless.
+   */
+  accepts(): readonly AttachmentKind[] {
+    return ['text'];
+  }
+
+  protected buildInvocation(opts: StreamOptions): { bin: string; args: string[]; prompt: string } {
+    const args = ['-p', '--output-format', 'stream-json'];
+    if (opts.cwd) {
+      args.push('--workspace', opts.cwd);
+    }
+    if (opts.sessionId) {
+      // Optional-value flag, so pass the id explicitly — otherwise it would swallow the
+      // trailing prompt positional as the chat id.
+      args.push('--resume', opts.sessionId);
+    }
+    if (opts.model && opts.model !== 'default') {
+      args.push('--model', opts.model);
+    }
+    if (opts.agent) {
+      // Agent mode: auto-approve edits/commands, or a headless run blocks on approval.
+      // Ask/Plan stay unforced. cursor-agent has no read-only sandbox flag, so read-only
+      // is best-effort — the inlined sema context asks it not to modify files.
+      args.push('--force');
+    }
+    // cursor-agent has no system-prompt channel, so the context inlines into the prompt
+    // (like Codex/opencode). Resume sends only the new user turn; the session holds the rest.
+    const atts = attachmentsFor(opts);
+    const prompt = opts.sessionId
+      ? opts.messages[opts.messages.length - 1]?.content ?? ''
+      : flattenPrompt(opts.system, opts.messages);
+    return { bin: 'cursor-agent', args, prompt: promptOrDefault(prompt, atts) };
+  }
+
+  protected extractDelta(event: unknown): string | null {
+    const o = event as { type?: string; message?: { content?: Array<{ type?: string; text?: string }> } };
+    // Each `assistant` event is a complete message chunk between tool calls; the chunks
+    // don't overlap, so appending each reconstructs the answer. The terminal `result`
+    // event repeats the full text and is deliberately NOT read here (that would double it).
+    if (o?.type === 'assistant' && Array.isArray(o.message?.content)) {
+      const text = o.message.content
+        .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join('');
+      return text || null;
+    }
+    return null;
+  }
+
+  protected extractThinking(): string | null {
+    // cursor-agent suppresses reasoning in print mode — none is emitted.
+    return null;
+  }
+
+  protected extractActivities(event: unknown): Activity[] {
+    const o = event as {
+      type?: string;
+      subtype?: string;
+      call_id?: string;
+      tool_call?: Record<string, { args?: Record<string, unknown> }>;
+    };
+    // Report on `started` only; `completed` repeats the same call_id and would double it.
+    if (o?.type !== 'tool_call' || o.subtype !== 'started' || !o.tool_call) {
+      return [];
+    }
+    const key = Object.keys(o.tool_call)[0];
+    if (!key) {
+      return [];
+    }
+    const args = o.tool_call[key]?.args ?? {};
+    const detail = String(
+      args.path ?? args.relativeWorkspacePath ?? args.command ?? args.pattern ?? '',
+    ).slice(0, 60);
+    // `readToolCall` → `Read`, `shellToolCall` → `Shell`, etc.
+    const bare = key.replace(/ToolCall$/, '');
+    const tool = bare ? bare.charAt(0).toUpperCase() + bare.slice(1) : 'Tool';
+    return [{ id: o.call_id, tool, detail }];
+  }
+
+  protected extractSession(event: unknown): string | null {
+    const o = event as { session_id?: string };
+    return typeof o?.session_id === 'string' ? o.session_id : null;
+  }
+
+  protected extractModel(event: unknown): string | null {
+    // The system/init event names the resolved model.
+    const o = event as { type?: string; model?: string };
+    return o?.type === 'system' && typeof o.model === 'string' ? o.model : null;
+  }
+
+  protected extractUsage(): TokenUsage | null {
+    // cursor-agent's stream-json reports no token usage or cost.
+    return null;
+  }
+
+  protected checkError(event: unknown): string | null {
+    const o = event as { type?: string; is_error?: boolean; result?: unknown };
+    if (o?.type === 'result' && o.is_error) {
+      return typeof o.result === 'string' && o.result ? o.result : 'Cursor Agent returned an error.';
+    }
+    return null;
   }
 }

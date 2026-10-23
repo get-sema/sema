@@ -9,26 +9,132 @@ This project adheres to [Semantic Versioning](https://semver.org).
 - **AvalAI provider** (`api.avalai.ir`) — an OpenAI-compatible gateway fronting Claude,
   GPT, Gemini, Grok, and open models under bare model ids. It is reachable from networks
   where the upstream vendor APIs are not, so chat keeps working through an internet
-  outage or regional block. Selecting it routes every request to `api.avalai.ir`: the
-  model id only names what AvalAI proxies to on its side, so `claude-opus-4-8` under
-  AvalAI never touches `api.anthropic.com`. Set a key in the panel → **Set key**
-  (from [chat.avalai.ir](https://chat.avalai.ir/platform/home)); works in Ask, Plan, and
-  Agent mode, and supports image/PDF attachments per model.
-- 16 curated models across Anthropic / OpenAI / Google / xAI / open models, verified
-  against the live catalogue; **+ custom id…** reaches the rest of the ~400 AvalAI
-  offers.
+  outage or regional block. Selecting it routes every request to `api.avalai.ir`; the
+  model id only names what AvalAI proxies to. Set a key in the panel → **Set key**
+  (from [chat.avalai.ir](https://chat.avalai.ir/platform/home)). AvalAI turns report no
+  cost: its inline `estimated_cost` is approximate by its own docs. The local CLIs are
+  unaffected — they still talk to their own vendor endpoints.
+- `sema.chat.codexUseWsl` (Windows): run Codex inside WSL — sign-in, status, and chat
+  all in the same runtime (#3).
 
-### Notes
-- AvalAI turns report **no cost**. Its inline `estimated_cost` is approximate by its own
-  docs, and exact figures need a second authenticated lookup keyed by `x-request-id` —
-  so sema reports nothing rather than a number the provider won't stand behind.
-- The outage escape hatch covers the **API-key providers only**. The local CLIs (Claude
-  Code, Codex, opencode) spawn their own binaries against their own vendor endpoints and
-  are unaffected by the provider's base URL.
+### Changed
+- Model catalogues refreshed from the providers' docs: Claude 5.x (Opus 5.5 default,
+  Sonnet 5.5, Haiku 5.5, Fable 5.1), GPT-6 (6.1 Sol default, Astra, Luna), DeepSeek
+  `deepseek-flash` / `deepseek-v4-pro`, current OpenRouter, Together AI, and Codex
+  lists. Prices and per-model cache-hit rates updated to match.
+- Marketplace category "Machine Learning" → "AI" (#4); repository links point at
+  `get-sema/sema` (#2).
 
-## [0.6.5]
+### Fixed
+- Claude agent loop: assistant turns are echoed back with their thinking blocks.
+  Dropping them broke tool use on the Claude 5.x models, where thinking is always on.
+- `claude-sonnet-5` was priced at $3/$15 instead of $2/$10.
+
+## [0.11.0]
+
+### Changed
+- **The repository moved to [github.com/get-sema/sema](https://github.com/get-sema/sema).**
+  Every link in the README and docs now points at the new home.
+- Rewritten README and refreshed Marketplace listing. No extension code
+  changed in this release; the version tracks `sema-mcp` 0.11.0.
+
+## [0.10.0]
 
 ### Added
+- **DevOps guard tools available in "Reuse a local CLI" mode.** Claude Code,
+  Codex, Grok Build, and Cursor now expose `devops_plan`/`devops_run`/
+  `devops_approve`/`devops_deny`/`devops_pending`/`devops_log` — an
+  analyze-first gate for `kubectl`/Terraform/AWS CLI/Helm that classifies
+  every command as safe, needs-approval, or prohibited before anything
+  executes, with secret redaction on both the command and its output. These
+  tools live in the `sema-mcp` MCP server (`sema-mcp` 0.9.0+, see
+  [docs/devops-guard.md](../docs/devops-guard.md)), so no extension code
+  changed — they just show up once the underlying `sema` install is current.
+  Not yet available in "Bring an API key" mode, which uses its own fixed
+  tool list rather than MCP discovery.
+
+## [0.9.0]
+
+### Added
+- **Update sema from the extension.** A new **"Update sema"** action — in the Manage panel
+  and the command palette (`sema: Update sema`) — upgrades the sema CLI / MCP server
+  (`sema-mcp`) to its latest release via `uv tool upgrade sema-mcp` (or `pipx upgrade`),
+  matching how the one-liner installs it. Reload VS Code afterward to load it. Runs the
+  package upgrade directly, so it works regardless of the installed sema version.
+
+### Changed
+- **Update agent CLIs** now re-runs each agent's official install script (`curl … | sh`)
+  instead of the CLI's own self-updater, which errored for some install methods.
+
+## [0.8.0]
+
+### Added
+- **"sema: Open Chat" command.** Reveal the chat sidebar from the command palette
+  (`Cmd/Ctrl+Shift+P` → **sema: Open Chat**), like Codex's "Open Codex Sidebar". Works
+  even before the panel has been opened.
+
+### Fixed
+- **Stop button now interrupts Codex Agent runs that are still starting up.** In Agent +
+  Approval mode, hitting Stop while the Codex app-server was in setup (`initialize` /
+  `thread-resume` / `turn-start`) left the request unsettled, so the run hung and the
+  spinner never stopped — most visible on a second message, which does a slower
+  `thread/resume`. The abort now rejects in-flight requests so the turn ends immediately.
+
+## [0.7.0]
+
+### Added
+- **Cursor as a local CLI chat provider.** Drives Cursor's headless agent (`cursor-agent`)
+  in print mode (`--output-format stream-json`), streaming the answer, tool activity, and
+  session resume, with **Sign in / Sign out** in the model menu like the other local CLIs.
+  Pick **Cursor (local)** in the provider picker; set `sema.chat.cursorPath` if
+  `cursor-agent` isn't on VS Code's PATH. Models come from `cursor-agent --list-models`
+  (`auto` is Cursor's own router). Two deliberate gaps mirror the CLI: reasoning is
+  suppressed in print mode, and the stream reports no token usage or cost.
+- **Register sema with Cursor from the Manage panel.** The Manage panel shows Cursor's
+  registration status alongside Claude Code, Codex, and Grok Build, with one-click
+  **Register with Cursor** / **Unregister Cursor** (writes `.cursor/mcp.json` in the
+  workspace, which Cursor reads), so a project you also open in Cursor gets sema's tools
+  there too. This is separate from the chat provider above: the provider chats *with*
+  Cursor's agent; this registers sema's tools *inside* Cursor.
+
+## [0.6.0]
+
+### Added
+- **Grok Build (xAI) as a local CLI provider.** Drives `grok` in headless mode
+  (`--output-format streaming-json`), streaming answers, reasoning, session resume, and
+  token usage, with **Sign in / Sign out** in the model menu like the other local CLIs.
+  Set `sema.chat.grokPath` if `grok` isn't on VS Code's PATH. Register sema with it from
+  the Manage panel, or with `sema init --grok`; `sema setup` and `sema update` detect it
+  too. Models come from what `grok models` actually reports (`grok-4.5`), not from xAI's
+  docs, which still name a `grok-build` model the live catalog doesn't list; the header
+  resolves what a turn really billed (e.g. `grok-4.5-build-free`). One deliberate gap:
+  Grok's stream carries no tool-call event, so Agent mode shows no per-tool activity.
+- **A header notice when the active provider can't answer yet.** Previously the only hint
+  was a dot on the model pill, which you had to open the menu to understand — so the first
+  feedback was a failed turn. Now the header shows **Sign in** or **Set API key** for the
+  active provider, naming it and acting as the shortcut to fix it. It stays hidden until
+  the sign-in check has actually run, so a signed-in user never sees a false warning.
+
+### Fixed
+- **Your prompt reaches the model as your prompt.** Sema's workflow and retrieved context
+  were concatenated in front of the user's turn for the local CLIs, so the model read them
+  as if the user had typed them — a bare "hi" came back as "I'll use sema's semantic index
+  first…" instead of a greeting. They now travel in each CLI's own system channel:
+  `claude --append-system-prompt` and `grok --rules`, matching the split the Claude Agent
+  SDK path already made. Codex and opencode expose no such flag (Codex's positional *is*
+  its instructions), so context is still inlined there, now with an explicit end-of-context
+  fence before the request. The API providers were already correct — Anthropic passes
+  `system`, and the OpenAI-compatible ones send a `system` role message. Nothing about what
+  sema injects changed, only where it goes: index context still reaches every provider.
+- **Signing in no longer needs a window reload to register.** Sign-in state was only
+  checked when the panel first loaded or the provider changed, and the existing triggers
+  both missed the normal case: the CLI's login leaves its terminal open at the shell
+  prompt, and the panel stays visible throughout, so neither the terminal-close nor the
+  visibility trigger fired. The panel now polls after launching a login and updates
+  itself, and re-checks when the window regains focus if it believes the provider is
+  signed out — which also catches a sign-in done in your own terminal. Both are bounded:
+  polling stops the moment sign-in lands, and the focus check is throttled and never runs
+  once signed in. Applies to every CLI provider, not just Grok.
 - **File attachments across every provider.** Attach images, PDFs, and text files to a
   chat turn with **📎**, by pasting a screenshot, by dropping a file on the composer, or
   from the Explorer context menu (`sema: Attach file to chat`). Each provider receives
@@ -99,6 +205,12 @@ This project adheres to [Semantic Versioning](https://semver.org).
 ## [0.5.0]
 
 ### Added
+- **Focused composer controls.** Attachments, Sema index/redaction/maintenance,
+  Ask/Plan/Agent mode, provider/model/effort, and agent permissions now have separate
+  controls instead of sharing the attachment and settings menus.
+- **Runtime CLI effort discovery.** The extension reads effort levels from the exact
+  configured Claude Code and Codex executables, including Codex's model-specific
+  catalog, and safely falls back for older Codex releases.
 - **Refreshed models with friendly display names.** The picker now shows readable names
   (e.g. "Opus 4.8") instead of raw ids, with optional `<optgroup>` sections supported in
   the schema. Model lists were updated: Claude Code (Opus 4.8 / Fable 5 / Sonnet 5 /
@@ -120,6 +232,9 @@ This project adheres to [Semantic Versioning](https://semver.org).
   read from the session rollout log Codex writes, then remembered per provider.
 
 ### Fixed
+- Stored reasoning effort is validated against the detected CLI and selected model
+  before every run. A stale `xhigh` choice can no longer break an older Codex binary,
+  and Codex authentication remains available when its config contains a newer level.
 - **opencode (local) now runs in your workspace.** In Agent mode opencode was
   operating from a temp directory — creating/editing files under `$TMPDIR/opencode`
   instead of the open project — because its server-based `run` ignores the spawned
