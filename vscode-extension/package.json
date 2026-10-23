@@ -169,6 +169,11 @@
           "default": "codex",
           "description": "Path to the Codex CLI (the 'Codex (local)' provider). Set an absolute path if `codex` isn't on VS Code's PATH."
         },
+        "sema.chat.codexUseWsl": {
+          "type": "boolean",
+          "default": false,
+          "description": "Windows only: run the Codex CLI inside WSL (sign-in, status, and chat) instead of natively. Turn on if Codex is installed in your WSL distro rather than on Windows."
+        },
         "sema.chat.opencodePath": {
           "type": "string",
           "default": "opencode",

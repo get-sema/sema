@@ -4,7 +4,7 @@ import { resolveCliInvocation } from './cliRuntime';
 
 test('Codex control commands use WSL on Windows', () => {
   assert.deepEqual(
-    resolveCliInvocation('codex', 'codex', ['login', 'status'], 'win32'),
+    resolveCliInvocation('codex', 'codex', ['login', 'status'], true, 'win32'),
     {
       executable: 'wsl.exe',
       args: ['--', 'bash', '-lc', "'codex' 'login' 'status'"],
@@ -14,7 +14,7 @@ test('Codex control commands use WSL on Windows', () => {
 
 test('a configured Codex path is passed to the WSL runtime', () => {
   assert.deepEqual(
-    resolveCliInvocation('codex', '/opt/codex/bin/codex', ['logout'], 'win32'),
+    resolveCliInvocation('codex', '/opt/codex/bin/codex', ['logout'], true, 'win32'),
     {
       executable: 'wsl.exe',
       args: ['--', 'bash', '-lc', "'/opt/codex/bin/codex' 'logout'"],
@@ -24,7 +24,7 @@ test('a configured Codex path is passed to the WSL runtime', () => {
 
 test('configured paths and arguments cannot inject WSL shell syntax', () => {
   assert.deepEqual(
-    resolveCliInvocation('codex', "/opt/user's bin/codex", ['-c', 'key=$(unsafe)'], 'win32'),
+    resolveCliInvocation('codex', "/opt/user's bin/codex", ['-c', 'key=$(unsafe)'], true, 'win32'),
     {
       executable: 'wsl.exe',
       args: [
@@ -39,7 +39,7 @@ test('configured paths and arguments cannot inject WSL shell syntax', () => {
 
 test('other Windows CLIs continue to execute natively', () => {
   assert.deepEqual(
-    resolveCliInvocation('claude-code', 'claude.exe', ['auth', 'status'], 'win32'),
+    resolveCliInvocation('claude-code', 'claude.exe', ['auth', 'status'], true, 'win32'),
     {
       executable: 'claude.exe',
       args: ['auth', 'status'],
@@ -49,9 +49,19 @@ test('other Windows CLIs continue to execute natively', () => {
 
 test('Codex executes directly when the extension host is already Linux', () => {
   assert.deepEqual(
-    resolveCliInvocation('codex', 'codex', ['login', 'status'], 'linux'),
+    resolveCliInvocation('codex', 'codex', ['login', 'status'], true, 'linux'),
     {
       executable: 'codex',
+      args: ['login', 'status'],
+    },
+  );
+});
+
+test('Codex runs natively on Windows unless WSL is opted into', () => {
+  assert.deepEqual(
+    resolveCliInvocation('codex', 'codex.exe', ['login', 'status'], false, 'win32'),
+    {
+      executable: 'codex.exe',
       args: ['login', 'status'],
     },
   );

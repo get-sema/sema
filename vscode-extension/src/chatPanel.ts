@@ -25,7 +25,7 @@ import {
   parseClaudeEfforts,
   parseCodexEfforts,
 } from './modelSelection';
-import { resolveCliInvocation } from './cliRuntime';
+import { codexUsesWsl, resolveCliInvocation } from './cliRuntime';
 
 const execFileAsync = promisify(execFile);
 
@@ -489,13 +489,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return `${provider.id}\0${this.cliBinFor(provider)}`;
   }
 
+  /** `sema.chat.codexUseWsl` — run Codex inside WSL on a Windows host. */
+  private codexWsl(): boolean {
+    return vscode.workspace.getConfiguration('sema').get<boolean>('chat.codexUseWsl', false);
+  }
+
   /**
    * Resolve a CLI control command in the same OS runtime used by interactive login.
-   * In particular, Windows-hosted Codex login runs in WSL, so its status and logout
-   * commands must also run there to observe the same credential store.
+   * When Codex is set to run in WSL, its status and logout commands must also run
+   * there to observe the same credential store.
    */
   private cliInvocation(provider: ChatProvider, args: readonly string[]) {
-    return resolveCliInvocation(provider.id, this.cliBinFor(provider), args);
+    return resolveCliInvocation(provider.id, this.cliBinFor(provider), args, this.codexWsl());
   }
 
   private discoveredEffortsForModel(provider: ChatProvider, model: string): readonly string[] {
@@ -579,10 +584,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       name: `sema · ${provider.label}`,
       cwd: this.repoRoot || undefined,
     };
-    // Codex CLI is supported through WSL on Windows. Explicitly select WSL here
-    // instead of inheriting the user's default VS Code terminal (usually PowerShell),
-    // where the Linux Codex executable is unavailable.
-    if (process.platform === 'win32' && provider.id === 'codex') {
+    // When Codex lives in WSL, select WSL explicitly instead of inheriting the
+    // user's default VS Code terminal (usually PowerShell), where the Linux Codex
+    // executable is unavailable.
+    if (codexUsesWsl(provider.id, this.codexWsl())) {
       terminalOptions.shellPath = 'wsl.exe';
     }
     const term = vscode.window.createTerminal(terminalOptions);
@@ -1251,6 +1256,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         apiKey,
         cwd: this.repoRoot,
         cliBin,
+        cliWsl: this.codexWsl(),
         agent,
         plan,
         semaBin: this.useIndex ? cfg.get<string>('binaryPath') || 'sema' : undefined,

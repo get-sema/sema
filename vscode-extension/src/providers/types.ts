@@ -88,6 +88,8 @@ export interface StreamOptions {
   cwd?: string;
   /** Override the CLI executable path (claude / codex) when not on PATH. */
   cliBin?: string;
+  /** Run the CLI inside WSL (Codex on a Windows host with `sema.chat.codexUseWsl`). */
+  cliWsl?: boolean;
   /** Agent mode: let CLI providers edit files instead of answering read-only. */
   agent?: boolean;
   /** Plan mode: investigate read-only and propose a step-by-step plan (no edits). */

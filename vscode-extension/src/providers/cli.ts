@@ -13,6 +13,7 @@ import {
   TokenUsage,
 } from './types';
 import { pathFor } from '../attachments';
+import { resolveCliInvocation } from '../cliRuntime';
 
 /**
  * Flatten the system context + conversation into a single prompt string for a CLI.
@@ -205,7 +206,8 @@ abstract class CliProvider implements ChatProvider {
     const exe = opts.cliBin && opts.cliBin.trim() ? opts.cliBin : bin;
 
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(exe, [...args, prompt], {
+      const inv = resolveCliInvocation(this.id, exe, [...args, prompt], !!opts.cliWsl);
+      const child = spawn(inv.executable, inv.args, {
         cwd: opts.cwd || undefined,
         signal: opts.signal,
       });
@@ -706,7 +708,8 @@ export class CodexProvider extends CliProvider {
   /** Codex app-server is the official bidirectional transport used by rich clients. */
   private async streamWithApprovals(opts: StreamOptions): Promise<void> {
     const exe = opts.cliBin && opts.cliBin.trim() ? opts.cliBin : 'codex';
-    const child = spawn(exe, ['app-server'], {
+    const inv = resolveCliInvocation(this.id, exe, ['app-server'], !!opts.cliWsl);
+    const child = spawn(inv.executable, inv.args, {
       cwd: opts.cwd || undefined,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
