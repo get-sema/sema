@@ -10,7 +10,7 @@ class Chunk:
     # Required identity fields
     id: str                          # globally unique: "path/to/file.ts::FunctionName"
     file: str                        # relative path from project root
-    language: str                    # "typescript" | "python" | "go"
+    language: str                    # "typescript" | "python" | "go" | "markdown" | a generic-parser language
     chunk_type: ChunkType
     name: str                        # symbol name
 

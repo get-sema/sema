@@ -27,18 +27,29 @@ from .base import (
 )
 
 # $ per 1M tokens (input, cached input, output), for the cost estimate.
+# Source: platform.claude.com/docs/en/about-claude/pricing. Haiku 5.5 uses its
+# <=100K-token prompt tier.
 PRICES: dict[str, tuple[float, float, float]] = {
+    "claude-fable-5-1": (10.0, 0.25, 50.0),
+    "claude-fable-5": (10.0, 1.0, 50.0),
+    "claude-opus-5-5": (4.0, 0.2, 20.0),
+    "claude-opus-5": (5.0, 0.5, 25.0),
     "claude-opus-4-8": (5.0, 0.5, 25.0),
     "claude-opus-4-7": (5.0, 0.5, 25.0),
-    "claude-sonnet-5": (3.0, 0.3, 15.0),
+    "claude-opus-4-6": (5.0, 0.5, 25.0),
+    "claude-sonnet-5-5": (2.0, 0.1, 10.0),
+    "claude-sonnet-5": (2.0, 0.2, 10.0),
+    "claude-sonnet-4-6": (3.0, 0.3, 15.0),
+    "claude-haiku-5-5": (0.1, 0.01, 0.5),
     "claude-haiku-4-5": (1.0, 0.1, 5.0),
-    "claude-fable-5": (10.0, 1.0, 50.0),
 }
 
 # Models on the adaptive-thinking surface: `budget_tokens`, temperature, top_p
 # and top_k are rejected there, and `display` must be set to see reasoning.
 _ADAPTIVE = {
-    "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5", "claude-fable-5",
+    "claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5",
+    "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5-5", "claude-sonnet-5",
+    "claude-haiku-5-5",
 }
 
 _EFFORT_MODELS = _ADAPTIVE
@@ -63,19 +74,19 @@ class AnthropicProvider(BaseProvider):
     label = "Claude (Anthropic)"
     requires_key = True
     reads_workspace = False
-    default_model = "claude-opus-4-8"
+    default_model = "claude-opus-5-5"
     key_env = "ANTHROPIC_API_KEY"
     efforts = ("default", "low", "medium", "high", "xhigh", "max")
     models = [
-        ModelInfo("claude-opus-4-8", "Claude Opus 4.8", "Most capable Opus tier",
+        ModelInfo("claude-opus-5-5", "Claude Opus 5.5", "Current Opus; default effort is medium",
                   recommended=True, accepts=("image", "pdf", "text")),
-        ModelInfo("claude-sonnet-5", "Claude Sonnet 5", "Best speed/intelligence balance",
+        ModelInfo("claude-sonnet-5-5", "Claude Sonnet 5.5", "Best speed/intelligence balance",
                   accepts=("image", "pdf", "text")),
-        ModelInfo("claude-haiku-4-5", "Claude Haiku 4.5", "Fastest and cheapest",
-                  accepts=("image", "pdf", "text"), efforts=()),
-        ModelInfo("claude-opus-4-7", "Claude Opus 4.7", "Previous-generation Opus",
+        ModelInfo("claude-haiku-5-5", "Claude Haiku 5.5", "Fastest and cheapest",
                   accepts=("image", "pdf", "text")),
-        ModelInfo("claude-fable-5", "Claude Fable 5", "Most capable; premium pricing",
+        ModelInfo("claude-fable-5-1", "Claude Fable 5.1", "Most capable; premium pricing",
+                  accepts=("image", "pdf", "text")),
+        ModelInfo("claude-opus-4-8", "Claude Opus 4.8", "Previous-generation Opus",
                   accepts=("image", "pdf", "text")),
     ]
 

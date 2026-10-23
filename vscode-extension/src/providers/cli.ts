@@ -342,10 +342,10 @@ export class ClaudeCodeProvider extends CliProvider {
   // Invocation values are the CLI aliases (always resolve to the latest of each tier),
   // with the current version shown as the display name. `claude --model` accepts these.
   readonly modelInfos: ModelInfo[] = [
-    { id: 'opus', alias: 'opus', name: 'Opus 4.8' },
-    { id: 'fable', alias: 'fable', name: 'Fable 5' },
-    { id: 'sonnet', alias: 'sonnet', name: 'Sonnet 5', recommended: true },
-    { id: 'haiku', alias: 'haiku', name: 'Haiku 4.5' },
+    { id: 'opus', alias: 'opus', name: 'Opus 5.5' },
+    { id: 'fable', alias: 'fable', name: 'Fable 5.1' },
+    { id: 'sonnet', alias: 'sonnet', name: 'Sonnet 5.5', recommended: true },
+    { id: 'haiku', alias: 'haiku', name: 'Haiku 5.5' },
   ];
   readonly defaultModel = 'sonnet';
   // Mirrors `claude --help`: "--effort <level>  Effort level for the current session
