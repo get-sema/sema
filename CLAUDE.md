@@ -51,7 +51,7 @@ Phase 1 complete. Phase 2 in progress.
 8 MCP tools implemented: search_code, check_reuse, get_code, repo_map,
 find_usages, explain_file, impact_analysis, list_projects.
 Multi-project serving (`sema init --root`) and the reuse guard are live.
-The terminal app (`sema chat`) is live: 3 modes, 10 providers, 14 tools, 34
+The terminal app (`sema chat`) is live: 3 modes, 11 providers, 14 tools, 34
 slash commands, sharing session storage with the VS Code extension.
 
 ## Terminal app rules

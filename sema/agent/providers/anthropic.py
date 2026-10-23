@@ -90,6 +90,13 @@ class AnthropicProvider(BaseProvider):
                   accepts=("image", "pdf", "text")),
     ]
 
+    def efforts_for(self, model_id: str) -> tuple[str, ...]:
+        # Effort is only sent to models on the effort surface, so a custom id off
+        # it (claude-haiku-4-5, say) offers no levels rather than ignored ones.
+        if model_id not in _EFFORT_MODELS:
+            return ()
+        return super().efforts_for(model_id)
+
     def _client(self, api_key: str | None):
         try:
             from anthropic import AsyncAnthropic

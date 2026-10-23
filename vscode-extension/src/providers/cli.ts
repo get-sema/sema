@@ -671,20 +671,26 @@ export class ClaudeCodeProvider extends CliProvider {
 export class CodexProvider extends CliProvider {
   readonly id = 'codex';
   readonly label = 'Codex (local)';
-  // Models and reasoning levels reported by `codex debug models` in CLI 0.144.5.
+  // GPT-6 entries follow developers.openai.com/codex/models (6.1 Sol is the default);
+  // the GPT-5.x levels are as reported by `codex debug models` in CLI 0.144.5. The
+  // panel also discovers the installed CLI's own catalogue at runtime.
   // codex-auto-review is an internal review model and is deliberately not offered.
   readonly modelInfos: ModelInfo[] = [
-    { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', recommended: true,
+    { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', recommended: true,
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra',
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-6-luna', name: 'GPT-6 Luna',
+      efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol',
       efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
     { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra',
       efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
     { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna',
       efforts: ['default', 'low', 'medium', 'high', 'xhigh', 'max'] },
     { id: 'gpt-5.5', name: 'GPT-5.5', efforts: ['default', 'low', 'medium', 'high', 'xhigh'] },
-    { id: 'gpt-5.4', name: 'GPT-5.4', efforts: ['default', 'low', 'medium', 'high', 'xhigh'] },
-    { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', efforts: ['default', 'low', 'medium', 'high', 'xhigh'] },
   ];
-  readonly defaultModel = 'gpt-5.6-sol';
+  readonly defaultModel = 'gpt-6.1-sol';
   // Codex has no --effort flag; effort is config, passed as
   // `-c model_reasoning_effort=<level>`. Parsing locally is not enough to qualify a
   // Provider-wide union for custom ids; curated models narrow this via ModelInfo.efforts.
@@ -1255,11 +1261,14 @@ export class OpenCodeProvider extends CliProvider {
   // reaches the rest. `accepts` marks what each model can actually read; entries without
   // one fall back to image+text.
   readonly modelInfos: ModelInfo[] = [
+    // Listed in opencode.ai/docs/zen; `opencode models` is the live source of truth.
+    { id: 'opencode/claude-opus-5', name: 'Claude Opus 5', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/claude-opus-4-8', name: 'Claude Opus 4.8', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/claude-sonnet-5', name: 'Claude Sonnet 5', recommended: true, accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/claude-fable-5', name: 'Claude Fable 5', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/claude-haiku-4-5', name: 'Claude Haiku 4.5', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/gpt-5.2-codex', name: 'GPT-5.2 Codex' },
+    { id: 'opencode/gpt-6-astra', name: 'GPT-6 Astra' },
     { id: 'opencode/gpt-5.6-sol', name: 'GPT-5.6 Sol', accepts: ['image', 'pdf', 'text'] },
     { id: 'opencode/gpt-5.4-mini', name: 'GPT-5.4 Mini' },
     { id: 'opencode/gemini-3.1-pro', name: 'Gemini 3.1 Pro', accepts: ['image', 'pdf', 'text'] },

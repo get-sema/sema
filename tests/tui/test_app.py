@@ -94,7 +94,7 @@ async def test_set_provider_resets_an_incompatible_model(app):
     async with app.run_test() as pilot:
         await pilot.pause()
         app.set_provider("openai")
-        assert app.session.model == "gpt-5.6-sol"
+        assert app.session.model == "gpt-6.1-sol"
 
 
 async def test_load_session_replays_the_transcript(app):
@@ -244,7 +244,7 @@ async def test_provider_and_model_survive_a_restart(tmp_path):
     async with first.run_test() as pilot:
         await pilot.pause()
         first.set_provider("openai")
-        first.set_model("gpt-5.6-luna")
+        first.set_model("gpt-6-luna")
         first.set_effort("high")
         first.set_mode("plan")
         await pilot.pause()
@@ -253,7 +253,7 @@ async def test_provider_and_model_survive_a_restart(tmp_path):
     async with second.run_test() as pilot:
         await pilot.pause()
         assert second.provider_id == "openai"
-        assert second.session.model == "gpt-5.6-luna"
+        assert second.session.model == "gpt-6-luna"
         assert second.session.effort == "high"
         assert second.session.mode == "plan"
 
@@ -284,7 +284,7 @@ async def test_a_saved_model_from_another_provider_is_discarded(tmp_path):
     app = SemaChatApp(root=root, base_dir=base)
     async with app.run_test() as pilot:
         await pilot.pause()
-        assert app.session.model == "claude-opus-4-8"
+        assert app.session.model == "claude-opus-5-5"
 
 
 async def test_an_unknown_saved_provider_falls_back(tmp_path):

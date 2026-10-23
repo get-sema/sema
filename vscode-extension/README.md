@@ -3,7 +3,7 @@
 **Love Cursor? You'll love sema.**
 
 A Cursor-style chat and agent panel inside VS Code — except **you** pick the
-provider and the model, and you can change your mind mid-conversation. Eight
+provider and the model, and you can change your mind mid-conversation. Eleven
 engines, one thread, backed by a local semantic index of your codebase.
 
 > **macOS and Linux.** The sema CLI installer is a POSIX shell script; the
@@ -52,9 +52,15 @@ Want to build it yourself instead? See [Build from source](#build-from-source).
 You need **one**, and you can switch any time — even mid-conversation.
 
 **A · Bring an API key** — nothing else to install. Pick **OpenRouter**,
-**OpenAI**, **DeepSeek**, **Together AI**, or **Claude (Anthropic API)** in the
+**OpenAI**, **DeepSeek**, **Together AI**, **AvalAI**, or **Claude (Anthropic API)** in the
 panel → **Set key** → paste. Keys live in VS Code SecretStorage, never in
 settings. OpenRouter is one gateway to models from many providers.
+
+**AvalAI** ([key from chat.avalai.ir](https://chat.avalai.ir/platform/home)) is another
+gateway, reachable from networks where the vendor APIs are blocked — the escape hatch
+for an internet outage. Selecting it routes **every** request to `api.avalai.ir`, so
+`claude-opus-5-5` under AvalAI never touches `api.anthropic.com`. It covers the API
+path only: the local CLIs keep talking to their own vendors.
 
 **B · Reuse a local CLI** — no key management at all; Claude Code, Codex, Grok
 Build, and Cursor use your existing subscription, opencode works with any
@@ -104,7 +110,7 @@ so the agent greps and reads files like any other assistant.
 
 ## Features
 
-- **One conversation, eight engines** — provider and model pickers stay live
+- **One conversation, eleven engines** — provider and model pickers stay live
   between turns. Local CLI providers stream thinking and tool activity like their
   terminal apps do, and keep **per-session memory**. Changing provider, model, or
   mode starts a compatible native CLI session while the extension preserves and
@@ -163,7 +169,7 @@ so the agent greps and reads files like any other assistant.
   | Claude Code | ✅ | ✅ | ✅ |
   | Anthropic, OpenAI | ✅ | ✅ | ✅ |
   | Codex | ✅ | — | ✅ |
-  | opencode, OpenRouter, Together | ✅¹ | ✅¹ | ✅ |
+  | opencode, OpenRouter, Together, AvalAI | ✅¹ | ✅¹ | ✅ |
   | DeepSeek, Grok Build | — | — | ✅ |
 
   ¹ Per model, since these are gateways. Pick a vision model (Claude, Gemini, GPT)
@@ -257,7 +263,7 @@ VS Code panels  ──CLI --json──►  sema (search / get / reuse / status) 
    │                                                                     (ChromaDB + SBERT)
    ├─ chat (local)  ──►  Claude Code / Codex / opencode CLI  ──stream──►  panel  (reads/edits repo)
    └─ chat (API)  ──context+tools──►  Anthropic SDK · OpenAI SDK  ──stream──►  panel
-                                      (OpenAI · DeepSeek · OpenRouter · Together AI share the OpenAI SDK)
+                                      (OpenAI · DeepSeek · OpenRouter · Together AI · AvalAI share the OpenAI SDK)
 ```
 
 Providers run in the Node extension host, so API keys never reach webview/page context.

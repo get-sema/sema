@@ -201,11 +201,12 @@ class CodexProvider(CliProvider):
     label = "Codex (local CLI)"
     binary = "codex"
     default_model = "default"
-    efforts = ("default", "minimal", "low", "medium", "high", "xhigh")
+    efforts = ("default", "low", "medium", "high", "xhigh", "max")
     models = [
         ModelInfo("default", "Default", recommended=True),
-        ModelInfo("gpt-5.6-sol", "GPT-5.6 Sol"),
-        ModelInfo("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ModelInfo("gpt-6.1-sol", "GPT-6.1 Sol"),
+        ModelInfo("gpt-6-astra", "GPT-6 Astra"),
+        ModelInfo("gpt-6-luna", "GPT-6 Luna"),
     ]
 
     def build_args(self, request: TurnRequest) -> list[str]:

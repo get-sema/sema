@@ -3,6 +3,33 @@
 All notable changes to the **sema** VS Code extension are documented here.
 This project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- **AvalAI provider** (`api.avalai.ir`) — an OpenAI-compatible gateway fronting Claude,
+  GPT, Gemini, Grok, and open models under bare model ids. It is reachable from networks
+  where the upstream vendor APIs are not, so chat keeps working through an internet
+  outage or regional block. Selecting it routes every request to `api.avalai.ir`; the
+  model id only names what AvalAI proxies to. Set a key in the panel → **Set key**
+  (from [chat.avalai.ir](https://chat.avalai.ir/platform/home)). AvalAI turns report no
+  cost: its inline `estimated_cost` is approximate by its own docs. The local CLIs are
+  unaffected — they still talk to their own vendor endpoints.
+- `sema.chat.codexUseWsl` (Windows): run Codex inside WSL — sign-in, status, and chat
+  all in the same runtime (#3).
+
+### Changed
+- Model catalogues refreshed from the providers' docs: Claude 5.x (Opus 5.5 default,
+  Sonnet 5.5, Haiku 5.5, Fable 5.1), GPT-6 (6.1 Sol default, Astra, Luna), DeepSeek
+  `deepseek-flash` / `deepseek-v4-pro`, current OpenRouter, Together AI, and Codex
+  lists. Prices and per-model cache-hit rates updated to match.
+- Marketplace category "Machine Learning" → "AI" (#4); repository links point at
+  `get-sema/sema` (#2).
+
+### Fixed
+- Claude agent loop: assistant turns are echoed back with their thinking blocks.
+  Dropping them broke tool use on the Claude 5.x models, where thinking is always on.
+- `claude-sonnet-5` was priced at $3/$15 instead of $2/$10.
+
 ## [0.11.0]
 
 ### Changed

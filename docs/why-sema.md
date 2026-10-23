@@ -50,13 +50,13 @@ already there instead of shipping a fourth function that does the same thing.
 ## The lock-in half — the extension
 
 The [VS Code extension](../vscode-extension/README.md) is a Cursor-style chat *and*
-agent that reads, edits, and runs your repo — with **nine engines in one
+agent that reads, edits, and runs your repo — with **eleven engines in one
 conversation**:
 
 - **Local CLIs** — Claude Code, Codex, opencode, Grok Build. Reuse your existing login; no API
   key.
-- **APIs** — Anthropic, OpenAI, DeepSeek, OpenRouter, Together AI. Bring your own
-  key.
+- **APIs** — Anthropic, OpenAI, DeepSeek, OpenRouter, Together AI, AvalAI. Bring
+  your own key. AvalAI stays reachable when the vendor APIs are blocked.
 
 Switch **provider and model between turns**, in the same thread. Plan it with
 Claude Code, hand it to Codex to build, review the diff with a cheap OpenRouter

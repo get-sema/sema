@@ -23,7 +23,7 @@ It runs in three places, and they share one index and one session:
 
 | Surface | What it is |
 |---|---|
-| **VS Code extension** | A Cursor-style chat panel with ten engines, agent permissions, and an opt-in redaction toggle |
+| **VS Code extension** | A Cursor-style chat panel with eleven engines, agent permissions, and an opt-in redaction toggle |
 | **`sema chat`** | The same agent as a terminal app — modes, tools, slash commands, resumable sessions |
 | **MCP server** | Register sema with Claude Code, Codex, opencode, Grok Build, or Cursor and they get semantic search in their own CLI — no extension needed |
 
@@ -66,10 +66,10 @@ Want *just* the extension, or *just* the index? Both work standalone.
 
 ---
 
-## Ten providers, no lock-in
+## Eleven providers, no lock-in
 
 Five local CLIs reuse the subscription you already pay for — **no API key, no
-re-login**. Five API providers need one key each.
+re-login**. Six API providers need one key each.
 
 | Provider | Kind | Needs |
 |---|---|---|
@@ -83,6 +83,12 @@ re-login**. Five API providers need one key each.
 | **DeepSeek** | API | `DEEPSEEK_API_KEY` |
 | **OpenRouter** | API | `OPENROUTER_API_KEY` |
 | **Together AI** | API | `TOGETHER_API_KEY` |
+| **AvalAI** | API gateway | `AVALAI_API_KEY` |
+
+**AvalAI** (`api.avalai.ir`) is an OpenAI-compatible gateway to Claude, GPT,
+Gemini, Grok, and open models that stays reachable from networks where the vendor
+APIs are blocked — keep it configured as the escape hatch for an internet outage.
+It covers the API path only: the local CLIs still talk to their own vendors.
 
 Provider, model, and reasoning effort are all switchable **inside a running
 conversation** — the history, the index, and your redaction and guard settings

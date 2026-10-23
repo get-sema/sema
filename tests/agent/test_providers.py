@@ -25,7 +25,7 @@ from sema.agent.tools import Tool
 def test_registry_matches_the_extension_ids():
     assert provider_ids() == [
         "claude-code", "codex", "opencode", "grok", "cursor",
-        "anthropic", "openai", "deepseek", "openrouter", "together",
+        "anthropic", "openai", "deepseek", "openrouter", "together", "avalai",
     ]
 
 
@@ -52,9 +52,14 @@ def test_every_provider_default_model_is_in_its_catalog():
 
 def test_efforts_for_model_override():
     provider = AnthropicProvider()
-    # Haiku declares an empty effort tuple, overriding the provider default.
+    # A custom id off the effort surface gets no levels; a 5.x model gets them all.
     assert provider.efforts_for("claude-haiku-4-5") == ()
     assert "xhigh" in provider.efforts_for("claude-opus-4-8")
+    assert "max" in provider.efforts_for("claude-haiku-5-5")
+    # GPT-5.6 stops at xhigh; GPT-6 adds max.
+    openai = get_provider("openai")
+    assert "max" not in openai.efforts_for("gpt-5.6-sol")
+    assert "max" in openai.efforts_for("gpt-6.1-sol")
 
 
 # ── Anthropic request shaping ───────────────────────────────────────────────

@@ -254,7 +254,7 @@ def test_provider_without_args_opens_a_picker(ctx):
     body = run(ctx, "/provider")
     title, ids, current = ctx.choices_offered[-1]
     assert title == "Provider"
-    assert "claude-code" in ids and "anthropic" in ids and len(ids) == 10
+    assert "claude-code" in ids and "anthropic" in ids and len(ids) == 11
     assert current == "anthropic"
     assert ctx.provider_id == "openai"
     assert "openai" in body
@@ -268,7 +268,7 @@ def test_provider_with_an_argument_skips_the_picker(ctx):
 
 def test_switching_provider_resets_an_incompatible_model(ctx):
     run(ctx, "/provider openai")
-    assert ctx.session.model == "gpt-5.6-sol"
+    assert ctx.session.model == "gpt-6.1-sol"
 
 
 def test_provider_rejects_an_unknown_id(ctx):
@@ -277,22 +277,22 @@ def test_provider_rejects_an_unknown_id(ctx):
 
 
 def test_model_picker_offers_the_current_provider_catalog(ctx):
-    ctx.next_choice = "claude-haiku-4-5"
+    ctx.next_choice = "claude-haiku-5-5"
     run(ctx, "/model")
     title, ids, current = ctx.choices_offered[-1]
     assert "Claude" in title
-    assert "claude-sonnet-5" in ids
+    assert "claude-sonnet-5-5" in ids
     assert current == "claude-opus-4-8"
-    assert ctx.session.model == "claude-haiku-4-5"
+    assert ctx.session.model == "claude-haiku-5-5"
 
 
 def test_model_picker_follows_a_provider_switch(ctx):
     run(ctx, "/provider openai")
-    ctx.next_choice = "gpt-5.6-luna"
+    ctx.next_choice = "gpt-6-luna"
     run(ctx, "/model")
     _title, ids, _current = ctx.choices_offered[-1]
     assert all(i.startswith("gpt-") for i in ids)
-    assert ctx.session.model == "gpt-5.6-luna"
+    assert ctx.session.model == "gpt-6-luna"
 
 
 def test_model_with_an_argument_skips_the_picker(ctx):

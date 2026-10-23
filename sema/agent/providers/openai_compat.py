@@ -258,50 +258,62 @@ class OpenAICompatibleProvider(BaseProvider):
 
 
 def openai_provider() -> OpenAICompatibleProvider:
+    # Source: developers.openai.com/api/docs/models and /pricing. GPT-6 takes
+    # reasoning_effort low..max (`none`/`minimal` 400 on gpt-6.1-sol).
+    gpt5 = ("default", "low", "medium", "high", "xhigh")
     return OpenAICompatibleProvider(
         id="openai",
         label="OpenAI",
         key_env="OPENAI_API_KEY",
-        default_model="gpt-5.6-sol",
-        efforts=("default", "low", "medium", "high", "xhigh"),
+        default_model="gpt-6.1-sol",
+        efforts=("default", "low", "medium", "high", "xhigh", "max"),
         models=[
-            ModelInfo("gpt-5.6-sol", "GPT-5.6 Sol", "Flagship", recommended=True,
+            ModelInfo("gpt-6.1-sol", "GPT-6.1 Sol", "Recommended for coding",
+                      recommended=True, accepts=("image", "text")),
+            ModelInfo("gpt-6-astra", "GPT-6 Astra", "Flagship; premium pricing",
                       accepts=("image", "pdf", "text")),
-            ModelInfo("gpt-5.6-terra", "GPT-5.6 Terra", "Balanced",
-                      accepts=("image", "pdf", "text")),
-            ModelInfo("gpt-5.6-luna", "GPT-5.6 Luna", "Cost-efficient",
-                      accepts=("image", "pdf", "text")),
-            ModelInfo("gpt-5.5", "GPT-5.5", accepts=("image", "pdf", "text")),
-            ModelInfo("gpt-5.4-mini", "GPT-5.4 Mini", accepts=("image", "pdf", "text")),
+            ModelInfo("gpt-6-luna", "GPT-6 Luna", "Cost-efficient",
+                      accepts=("image", "text")),
+            ModelInfo("gpt-5.6-sol", "GPT-5.6 Sol", "Previous generation",
+                      accepts=("image", "pdf", "text"), efforts=gpt5),
+            ModelInfo("gpt-5.6-terra", "GPT-5.6 Terra", "Previous generation",
+                      accepts=("image", "pdf", "text"), efforts=gpt5),
         ],
         prices={
+            "gpt-6-astra": (10.0, 1.0, 50.0),
+            "gpt-6.1-sol": (2.0, 0.1, 10.0),
+            "gpt-6-sol": (2.0, 0.2, 10.0),
+            "gpt-6-luna": (0.1, 0.01, 0.5),
+            # List price; a promotional 4/0.4/20 runs to at least 2026-11-21.
             "gpt-5.6-sol": (5.0, 0.5, 30.0),
             "gpt-5.6": (5.0, 0.5, 30.0),
-            "gpt-5.6-terra": (2.5, 0.25, 15.0),
-            "gpt-5.6-luna": (1.0, 0.1, 6.0),
+            "gpt-5.6-terra": (2.0, 0.2, 12.0),
+            "gpt-5.6-luna": (0.2, 0.02, 1.2),
             "gpt-5.5": (5.0, 0.5, 30.0),
             "gpt-5.5-pro": (30.0, 30.0, 180.0),
             "gpt-5.4": (2.5, 0.25, 15.0),
             "gpt-5.4-mini": (0.75, 0.075, 4.5),
-            "gpt-5.4-nano": (0.2, 0.02, 1.25),
         },
     )
 
 
 def deepseek_provider() -> OpenAICompatibleProvider:
+    # Source: api-docs.deepseek.com/quick_start/pricing. Peak-hour rates, so the
+    # estimate is an upper bound: off-peak bills at half. deepseek-chat and
+    # deepseek-reasoner were retired 2026-07-24.
     return OpenAICompatibleProvider(
         id="deepseek",
         label="DeepSeek",
         key_env="DEEPSEEK_API_KEY",
         base_url="https://api.deepseek.com",
-        default_model="deepseek-chat",
+        default_model="deepseek-flash",
         models=[
-            ModelInfo("deepseek-chat", "DeepSeek Chat", recommended=True),
-            ModelInfo("deepseek-reasoner", "DeepSeek Reasoner", "Chain-of-thought"),
+            ModelInfo("deepseek-flash", "DeepSeek Flash", "V4.1 Flash", recommended=True),
+            ModelInfo("deepseek-v4-pro", "DeepSeek V4 Pro"),
         ],
         prices={
-            "deepseek-chat": (0.27, 0.07, 1.1),
-            "deepseek-reasoner": (0.55, 0.14, 2.19),
+            "deepseek-flash": (0.30, 0.006, 1.20),
+            "deepseek-v4-pro": (1.32, 0.044, 3.96),
         },
     )
 
@@ -312,29 +324,69 @@ def openrouter_provider() -> OpenAICompatibleProvider:
         label="OpenRouter",
         key_env="OPENROUTER_API_KEY",
         base_url="https://openrouter.ai/api/v1",
-        default_model="anthropic/claude-opus-4-8",
+        default_model="anthropic/claude-opus-5.5",
         models=[
-            ModelInfo("anthropic/claude-opus-4-8", "Claude Opus 4.8", recommended=True,
+            ModelInfo("anthropic/claude-opus-5.5", "Claude Opus 5.5", recommended=True,
                       accepts=("image", "pdf", "text")),
-            ModelInfo("openai/gpt-5.6", "GPT-5.6", accepts=("image", "pdf", "text")),
-            ModelInfo("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro"),
-            ModelInfo("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash"),
-            ModelInfo("google/gemini-3-pro", "Gemini 3 Pro", accepts=("image", "text")),
+            ModelInfo("anthropic/claude-sonnet-5.5", "Claude Sonnet 5.5",
+                      accepts=("image", "pdf", "text")),
+            ModelInfo("openai/gpt-6.1-sol", "GPT-6.1 Sol", accepts=("image", "text")),
+            ModelInfo("google/gemini-4-argon", "Gemini 4 Argon", accepts=("image", "text")),
+            ModelInfo("x-ai/grok-4.7", "Grok 4.7"),
+            ModelInfo("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
+            ModelInfo("z-ai/glm-5.3", "GLM 5.3"),
+            ModelInfo("moonshotai/kimi-k3", "Kimi K3"),
         ],
     )
 
 
 def together_provider() -> OpenAICompatibleProvider:
+    # Source: docs.together.ai/docs/serverless/models. The Qwen3 Coder and
+    # meta-llama chat models have left serverless.
     return OpenAICompatibleProvider(
         id="together",
         label="Together AI",
         key_env="TOGETHER_API_KEY",
-        base_url="https://api.together.xyz/v1",
-        default_model="deepseek-ai/DeepSeek-V3",
+        base_url="https://api.together.ai/v1",
+        default_model="zai-org/GLM-5.3",
         models=[
-            ModelInfo("deepseek-ai/DeepSeek-V3", "DeepSeek V3", recommended=True),
-            ModelInfo("deepseek-ai/DeepSeek-R1", "DeepSeek R1", "Reasoning"),
-            ModelInfo("meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-                      "Llama 4 Maverick"),
+            ModelInfo("zai-org/GLM-5.3", "GLM 5.3", "Together's pick for coding agents",
+                      recommended=True),
+            ModelInfo("moonshotai/Kimi-K3", "Kimi K3"),
+            ModelInfo("deepseek-ai/DeepSeek-V4-Pro-0813", "DeepSeek V4 Pro"),
+            ModelInfo("deepseek-ai/DeepSeek-V4.1-Flash", "DeepSeek V4.1 Flash"),
+            ModelInfo("Qwen/Qwen3.6-Plus", "Qwen3.6 Plus"),
+            ModelInfo("openai/gpt-oss-120b", "gpt-oss 120B"),
+        ],
+    )
+
+
+def avalai_provider() -> OpenAICompatibleProvider:
+    """AvalAI — an OpenAI-compatible gateway reachable when vendor APIs are not.
+
+    Selecting it routes every request to api.avalai.ir; the model id only names
+    what AvalAI proxies to. No cost is reported: AvalAI's inline
+    ``estimated_cost`` is approximate by its own docs.
+    """
+    vision = ("image", "pdf", "text")
+    return OpenAICompatibleProvider(
+        id="avalai",
+        label="AvalAI",
+        key_env="AVALAI_API_KEY",
+        base_url="https://api.avalai.ir/v1",
+        default_model="claude-opus-5-5",
+        models=[
+            ModelInfo("claude-opus-5-5", "Claude Opus 5.5", section="Anthropic",
+                      recommended=True, accepts=vision),
+            ModelInfo("claude-sonnet-5-5", "Claude Sonnet 5.5", section="Anthropic",
+                      accepts=vision),
+            ModelInfo("claude-haiku-5-5", "Claude Haiku 5.5", section="Anthropic",
+                      accepts=vision),
+            ModelInfo("gpt-6.1-sol", "GPT-6.1 Sol", section="OpenAI",
+                      accepts=("image", "text")),
+            ModelInfo("gemini-4-argon", "Gemini 4 Argon", section="Google", accepts=vision),
+            ModelInfo("grok-4.7", "Grok 4.7", section="xAI"),
+            ModelInfo("deepseek-v4.1-flash", "DeepSeek V4.1 Flash", section="Open models"),
+            ModelInfo("glm-5.3", "GLM 5.3", section="Open models"),
         ],
     )

@@ -26,6 +26,7 @@ from .cli_agent import (
 )
 from .openai_compat import (
     OpenAICompatibleProvider,
+    avalai_provider,
     deepseek_provider,
     openai_provider,
     openrouter_provider,
@@ -54,6 +55,7 @@ def _build() -> list[BaseProvider]:
         deepseek_provider(),
         openrouter_provider(),
         together_provider(),
+        avalai_provider(),
     ]
 
 

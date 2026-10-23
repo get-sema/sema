@@ -142,6 +142,7 @@ providers read the matching environment variable.
 | DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | ✅ wire protocol (mock server) |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | ✅ wire protocol (mock server) |
 | Together AI | `together` | `TOGETHER_API_KEY` | ✅ wire protocol (mock server) |
+| AvalAI | `avalai` | `AVALAI_API_KEY` | ⚠️ OpenAI-compatible; not run against the gateway |
 
 "Verified" means run for real against the live CLI, or — for the API providers —
 against a local server speaking the provider's actual SSE format, which

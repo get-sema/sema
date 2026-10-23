@@ -13,23 +13,22 @@ export const togetherProvider = new OpenAICompatibleProvider({
   baseURL: 'https://api.together.ai/v1',
   secretKey: 'sema.apiKey.together',
   keyHint: 'api.together.ai/settings/api-keys',
-  modelHint: 'org/Model slug — e.g. Qwen/Qwen3.6-Plus, deepseek-ai/DeepSeek-R1 (see together.ai/models)',
+  modelHint: 'org/Model slug — e.g. zai-org/GLM-5.3, moonshotai/Kimi-K3 (see docs.together.ai/docs/serverless/models)',
   // As with OpenRouter: images are allowed by default because a custom slug's modality
   // is unknowable, and the curated entries below carry an explicit `accepts`. Together's
-  // catalogue is mostly text-only open models, so most of them say so.
+  // catalogue is mostly text-only open models, so most of them say so. The Qwen3 Coder
+  // and meta-llama chat models have left serverless.
   accepts: ['image', 'text'],
   modelInfos: [
-    { id: 'deepseek-ai/DeepSeek-V3', name: 'DeepSeek V3', accepts: ['text'] },
-    { id: 'deepseek-ai/DeepSeek-R1', name: 'DeepSeek R1', accepts: ['text'] },
-    { id: 'Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8', name: 'Qwen3 Coder 480B', accepts: ['text'] },
-    { id: 'Qwen/Qwen3-235B-A22B-fp8-tput', name: 'Qwen3 235B', accepts: ['text'] },
-    { id: 'moonshotai/Kimi-K2-Instruct', name: 'Kimi K2', accepts: ['text'] },
-    { id: 'zai-org/GLM-4.5', name: 'GLM 4.5', accepts: ['text'] },
-    // The Llama 4 models are natively multimodal.
-    { id: 'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8', name: 'Llama 4 Maverick' },
-    { id: 'meta-llama/Llama-4-Scout-17B-16E-Instruct', name: 'Llama 4 Scout' },
-    { id: 'agentica-org/DeepCoder-14B-Preview', name: 'DeepCoder 14B', accepts: ['text'] },
-    { id: 'Qwen/Qwen2.5-Coder-32B-Instruct', name: 'Qwen2.5 Coder 32B', accepts: ['text'] },
+    { id: 'zai-org/GLM-5.3', name: 'GLM 5.3', recommended: true, accepts: ['text'] },
+    { id: 'moonshotai/Kimi-K3', name: 'Kimi K3', accepts: ['text'] },
+    { id: 'moonshotai/Kimi-K2.7-Code', name: 'Kimi K2.7 Code', accepts: ['text'] },
+    { id: 'deepseek-ai/DeepSeek-V4-Pro-0813', name: 'DeepSeek V4 Pro', accepts: ['text'] },
+    // V4.1 Flash takes image input.
+    { id: 'deepseek-ai/DeepSeek-V4.1-Flash', name: 'DeepSeek V4.1 Flash' },
+    { id: 'Qwen/Qwen3.6-Plus', name: 'Qwen3.6 Plus', accepts: ['text'] },
+    { id: 'zai-org/GLM-5.3-Flash', name: 'GLM 5.3 Flash', accepts: ['text'] },
+    { id: 'openai/gpt-oss-120b', name: 'gpt-oss 120B', accepts: ['text'] },
   ],
-  defaultModel: 'deepseek-ai/DeepSeek-V3',
+  defaultModel: 'zai-org/GLM-5.3',
 });
